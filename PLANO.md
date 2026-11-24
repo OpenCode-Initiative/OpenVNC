@@ -74,7 +74,7 @@ Ordem de execução (cada item com testes por fixtures de bytes):
 
 **Aceite:** TigerVNC viewer conecta ao servidor de referência; animação simples a 30 FPS com baixo CPU.
 
-**Status v0.2:** concluída. Aceite verificado em Xvfb (job `interop-reference`): o vncviewer do TigerVNC recebe o test-pattern a 29,9 FPS com ~3,5% de CPU no servidor.
+**Status v0.2:** parcial: o aceite foi atingido, mas faltam os backends DXGI, Wayland e macOS do item 1. Aceite verificado localmente em Xvfb, num container com os mesmos passos do job `interop-reference` (que ainda não rodou no GitHub): o vncviewer do TigerVNC recebe o test-pattern a 29,9 FPS com ~3,5% de CPU no servidor.
 
 - Backends: test-pattern (todas as plataformas), X11 (GetImage + XTest, sem `unsafe`) e Windows (GDI BitBlt + SendInput, com `unsafe` isolado no módulo). Ficam para depois: DXGI Desktop Duplication, Wayland (portal/PipeWire) e macOS.
 - Cliente: Tight (sem JPEG), Cursor, DesktopSize e ExtendedDesktopSize; testado contra o Xvnc, inclusive `xrandr`.
