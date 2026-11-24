@@ -5,23 +5,30 @@
 //! | SO | Captura | Entrada |
 //! |---|---|---|
 //! | Qualquer | [`TestPattern`] (sintetico, para CI e benchmarks) | [`NullInjector`] |
-//! | Windows | GDI `BitBlt` ([`windows::GdiCapture`]) | `SendInput` ([`windows::SendInputInjector`]) |
+//! | Windows | DXGI Desktop Duplication ([`dxgi::DxgiCapture`]), GDI `BitBlt` ([`windows::GdiCapture`]) como reserva | `SendInput` ([`windows::SendInputInjector`]) |
 //! | Linux X11 | `GetImage` ([`x11::X11Capture`]) | XTest ([`x11::XTestInjector`]) |
-//! | Wayland | nao suportado ainda (PipeWire/portal) | nao suportado |
-//! | macOS | nao suportado ainda (ScreenCaptureKit) | nao suportado |
+//! | Wayland (feature `wayland`) | portal ScreenCast + PipeWire ([`wayland::WaylandCapture`]) | portal RemoteDesktop ([`wayland::PortalInjector`]) |
+//! | macOS (so compilado, nao testado) | CoreGraphics `CGDisplayCreateImage` ([`macos::CgCapture`]) | `CGEventPost` ([`macos::CgEventInjector`]) |
 //!
-//! O DXGI Desktop Duplication (Windows) e o MIT-SHM/Damage (X11) ficam
-//! para depois; os backends atuais copiam o quadro inteiro e o servidor
-//! descobre as regioes alteradas comparando tiles.
+//! O MIT-SHM/Damage (X11) e o ScreenCaptureKit (macOS) ficam para depois;
+//! os backends copiam o quadro inteiro e o servidor descobre as regioes
+//! alteradas comparando tiles.
 
 use openvnc_core::{Error, KeyEvent, PointerEvent, Rect, Result};
 use openvnc_framebuffer::Framebuffer;
 
 #[cfg(windows)]
+pub mod dxgi;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(windows)]
 pub mod windows;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub mod x11;
+
+#[cfg(all(unix, not(target_os = "macos"), feature = "wayland"))]
+pub mod wayland;
 
 /// Versao do crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -136,26 +143,46 @@ impl ScreenCapture for TestPattern {
 pub fn native_capture() -> Result<Box<dyn ScreenCapture>> {
     #[cfg(windows)]
     {
+        // DXGI primeiro; GDI quando nao ha GPU/sessao interativa, ou com
+        // OPENVNC_CAPTURE=gdi (captura a area virtual de todos os monitores)
+        if std::env::var("OPENVNC_CAPTURE").as_deref() != Ok("gdi") {
+            match dxgi::DxgiCapture::new() {
+                Ok(c) => return Ok(Box::new(c)),
+                Err(e) => tracing::warn!(%e, "DXGI indisponivel; usando GDI"),
+            }
+        }
         Ok(Box::new(windows::GdiCapture::new()?))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if wayland_session() {
+            #[cfg(feature = "wayland")]
+            return Ok(Box::new(wayland::WaylandCapture::new()?));
+            #[cfg(not(feature = "wayland"))]
             return Err(Error::Unsupported(
-                "captura Wayland (PipeWire/portal) ainda nao implementada".into(),
+                "sessao Wayland: compile com a feature `wayland` (portal + PipeWire)".into(),
             ));
         }
         Ok(Box::new(x11::X11Capture::new()?))
     }
     #[cfg(target_os = "macos")]
     {
-        Err(Error::Unsupported(
-            "captura macOS (ScreenCaptureKit) ainda nao implementada".into(),
-        ))
+        Ok(Box::new(macos::CgCapture::new()?))
     }
     #[cfg(not(any(windows, unix)))]
     {
         Err(Error::Unsupported("SO sem backend de captura".into()))
+    }
+}
+
+/// Wayland quando ha `WAYLAND_DISPLAY` e nao ha `DISPLAY` (XWayland), ou
+/// quando `OPENVNC_CAPTURE=wayland` forca.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn wayland_session() -> bool {
+    match std::env::var("OPENVNC_CAPTURE").as_deref() {
+        Ok("wayland") => true,
+        Ok("x11") => false,
+        _ => std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_some(),
     }
 }
 
@@ -167,9 +194,21 @@ pub fn native_injector() -> Result<Box<dyn InputInjector>> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        if wayland_session() {
+            #[cfg(feature = "wayland")]
+            return Ok(Box::new(wayland::PortalInjector::new()?));
+            #[cfg(not(feature = "wayland"))]
+            return Err(Error::Unsupported(
+                "sessao Wayland: compile com a feature `wayland` (portal + PipeWire)".into(),
+            ));
+        }
         Ok(Box::new(x11::XTestInjector::new()?))
     }
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::CgEventInjector::new()))
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         Err(Error::Unsupported("SO sem backend de entrada".into()))
     }

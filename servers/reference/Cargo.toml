@@ -28,5 +28,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 getrandom = "0.2"
 
+[features]
+wayland = ["openvnc-platform/wayland"]
+
 [lints]
 workspace = true

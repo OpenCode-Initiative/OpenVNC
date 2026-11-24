@@ -136,3 +136,31 @@ jobs:
       - run: cargo build --release -p openvnc-server -p openvnc-cli
       - name: TigerVNC viewer x openvnc-server; openvnc x Xvnc
         run: BIN=target/release/openvnc-server CLI=target/release/openvnc bash ci/interop/run.sh
+
+  wayland:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev clang libclang-dev pkg-config \
+            sway xdg-desktop-portal xdg-desktop-portal-wlr pipewire pipewire-bin wireplumber \
+            dbus dbus-x11 dbus-user-session xvfb tigervnc-viewer tigervnc-tools \
+            imagemagick x11-apps procps foot \
+            gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-base
+      - run: rustup component add clippy
+      - run: cargo clippy -p openvnc-platform -p openvnc-server --features openvnc-server/wayland --all-targets -- -D warnings
+      - run: cargo build --release -p openvnc-server --features wayland
+      - name: PipeWire -> openvnc-server -> vncviewer
+        run: BIN=target/release/openvnc-server bash ci/wayland/run.sh
+
+  macos-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p openvnc-platform -p openvnc-server --all-targets -- -D warnings
+      - run: cargo test -p openvnc-platform

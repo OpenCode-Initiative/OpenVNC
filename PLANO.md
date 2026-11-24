@@ -74,9 +74,13 @@ Ordem de execução (cada item com testes por fixtures de bytes):
 
 **Aceite:** TigerVNC viewer conecta ao servidor de referência; animação simples a 30 FPS com baixo CPU.
 
-**Status v0.2:** parcial: o aceite foi atingido, mas faltam os backends DXGI, Wayland e macOS do item 1. Aceite verificado localmente em Xvfb, num container com os mesmos passos do job `interop-reference` (que ainda não rodou no GitHub): o vncviewer do TigerVNC recebe o test-pattern a 29,9 FPS com ~3,5% de CPU no servidor.
+**Status v0.2:** concluída, com ressalvas de teste nos backends (abaixo). Aceite verificado localmente em Xvfb, num container com os mesmos passos do job `interop-reference` (que ainda não rodou no GitHub): o vncviewer do TigerVNC recebe o test-pattern a 29,9 FPS com ~3,5% de CPU no servidor.
 
-- Backends: test-pattern (todas as plataformas), X11 (GetImage + XTest, sem `unsafe`) e Windows (GDI BitBlt + SendInput, com `unsafe` isolado no módulo). Ficam para depois: DXGI Desktop Duplication, Wayland (portal/PipeWire) e macOS.
+- Backends: test-pattern (todas as plataformas), X11 (GetImage + XTest, sem `unsafe`), Windows, Wayland e macOS:
+  - **Windows**: DXGI Desktop Duplication (padrão) com GDI BitBlt de reserva (`OPENVNC_CAPTURE=gdi`) + SendInput. DXGI testado nesta máquina (teste `#[ignore]` `captures_primary_output`: 10 quadros em ~0,31 s, sem inspecionar conteúdo).
+  - **Wayland** (feature `wayland`, exige `libpipewire-0.3-dev` e clang): portal RemoteDesktop+ScreenCast (cai para ScreenCast puro se não houver RemoteDesktop) + PipeWire; entrada pelo portal RemoteDesktop. Testado em container (`ci/wayland/run.sh`, job `wayland`): o caminho PipeWire → servidor → vncviewer foi verificado de ponta a ponta com um nó `videotestsrc` (`OPENVNC_PIPEWIRE_NODE`, que pula o portal). A sessão do portal foi exercitada até o backend, mas o xdg-desktop-portal-wlr 0.7 exige GPU (`/dev/dri`/gbm) e não entrega quadros no container; **portal com quadros reais e entrada RemoteDesktop não foram testados** (o portal-wlr não tem RemoteDesktop; precisa de GNOME/KDE).
+  - **macOS**: CoreGraphics `CGDisplayCreateImage` + `CGEventPost`, FFI direta. **Só compilado** (clippy para `aarch64-apple-darwin` e job `macos-build`); nunca rodou num Mac. Pendente: migrar para ScreenCaptureKit (`CGDisplayCreateImage` está obsoleto no macOS 15) e testar permissões de Gravação de Tela/Acessibilidade.
+  - Fica para depois: MIT-SHM/Damage no X11 (hoje GetImage do quadro inteiro).
 - Cliente: Tight (sem JPEG), Cursor, DesktopSize e ExtendedDesktopSize; testado contra o Xvnc, inclusive `xrandr`.
 - Benchmarks (`cargo bench -p openvnc-codecs`, 1280x720): encode raw 2,4 ms / hextile 2,5 ms / zrle 3,2 ms; decode 0,94 / 0,15 / 1,37 ms.
 - Renderer nativo (`OPENVNC_RENDERER=native openvnc-desktop host`): winit + softbuffer, sem GL. Mediu 24 MB de working set e 12 MB privados no Windows com animação, contra 98–111 MB do glow. A GUI de conexão continua em egui.
