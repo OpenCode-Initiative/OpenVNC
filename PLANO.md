@@ -61,6 +61,8 @@ Ordem de execução (cada item com testes por fixtures de bytes):
 
 **Critérios de aceite v0.1:** conecta e opera TigerVNC e TightVNC (3.3/3.7/3.8); inicialização ≤ 2 s; RAM idle ≤ 100 MB; CPU ~0% com tela parada; reconexão/desconexão tratadas sem crash.
 
+**Status v0.1:** concluída. Todos os critérios passaram, exceto a RAM ociosa: 98–111 MB privados no Windows com GPU AMD, quase tudo do driver OpenGL. O usuário aceitou o valor; a correção ficou para a v0.2 ([docs/renderer-proprio.md](docs/renderer-proprio.md)).
+
 ## Fase 2 — v0.2 Servidor de referência + otimização gráfica
 
 1. Traits `ScreenCapture` e `InputInjector` com implementações: Windows (DXGI Desktop Duplication / SendInput), Linux X11 (XCB+SHM/Damage, XTest), Wayland (PipeWire/portal), macOS (ScreenCaptureKit/CGEvent, permissões).
@@ -68,6 +70,7 @@ Ordem de execução (cada item com testes por fixtures de bytes):
 3. Encodings P1 no cliente: Tight, Cursor pseudo-encoding, DesktopSize; P2: ExtendedDesktopSize (multi-monitor).
 4. FPS adaptativo (não renderizar com tela parada; agrupar sob movimento intenso).
 5. Benchmarks reproduzíveis (`criterion` + cenários fixos) de CPU, RAM, latência.
+6. Renderer próprio no cliente desktop (GDI/Direct2D, X11 SHM, wl_shm, CALayer) no lugar de egui+OpenGL durante a sessão, para tirar o driver GL da RAM ociosa. A v0.1 fechou com 98–111 MB privados, contra a meta de 100 MB. Detalhes em [docs/renderer-proprio.md](docs/renderer-proprio.md).
 
 **Aceite:** TigerVNC viewer conecta ao servidor de referência; animação simples a 30 FPS com baixo CPU.
 
