@@ -181,7 +181,7 @@ fn unannounced_encoding_and_unknown_message_rejected() {
     base.extend(server_init(4, 4, ""));
     let mut s = base.clone();
     s.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1]);
-    s.extend_from_slice(&7i32.to_be_bytes());
+    s.extend_from_slice(&6i32.to_be_bytes());
     assert!(Client::new(Config::default()).feed(&s).is_err());
     let mut s = base;
     s.push(99);
@@ -214,4 +214,92 @@ fn client_messages_encoding() {
         c.take_output(),
         vec![4, 1, 0, 0, 0, 0, 0xff, 0x0d, 5, 1, 1, 2, 0, 3, 6, 0, 0, 0, 0, 0, 0, 2, b'a', b'?']
     );
+}
+
+fn rect_hdr(x: u16, y: u16, w: u16, h: u16, enc: i32) -> Vec<u8> {
+    let mut v = Vec::new();
+    for n in [x, y, w, h] {
+        v.extend_from_slice(&n.to_be_bytes());
+    }
+    v.extend_from_slice(&enc.to_be_bytes());
+    v
+}
+
+fn pseudo_script() -> Vec<u8> {
+    let mut s = script(
+        b"RFB 003.008
+",
+    );
+    s.truncate(12 + 3 + 4);
+    s.extend(server_init(4, 4, ""));
+    s
+}
+
+#[test]
+fn desktop_size_and_extended_resize() {
+    let mut s = pseudo_script();
+    // DesktopSize 8x6 seguido de um Raw no tamanho novo, mesmo update
+    s.extend_from_slice(&[0, 0, 0, 2]);
+    s.extend(rect_hdr(0, 0, 8, 6, -223));
+    s.extend(rect_hdr(7, 5, 1, 1, 0));
+    s.extend_from_slice(&[1, 2, 3, 0]);
+    // ExtendedDesktopSize recusado (y = 3): nada muda
+    s.extend_from_slice(&[0, 0, 0, 1]);
+    s.extend(rect_hdr(1, 3, 99, 99, -308));
+    s.extend_from_slice(&[1, 0, 0, 0]);
+    s.extend_from_slice(&[0; 16]);
+    // ExtendedDesktopSize aceito 10x10 com 1 tela
+    s.extend_from_slice(&[0, 0, 0, 1]);
+    s.extend(rect_hdr(0, 0, 10, 10, -308));
+    s.extend_from_slice(&[1, 0, 0, 0]);
+    s.extend_from_slice(&[0; 16]);
+    for whole in [true, false] {
+        let mut c = Client::new(Config::default());
+        if whole {
+            c.feed(&s).unwrap();
+        } else {
+            for b in &s {
+                c.feed(std::slice::from_ref(b)).unwrap();
+            }
+        }
+        let ev: Vec<Event> = std::iter::from_fn(|| c.poll_event()).collect();
+        let resized: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                Event::Resized { width, height } => Some((*width, *height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resized, vec![(8, 6), (10, 10)]);
+        assert_eq!(c.framebuffer().unwrap().width(), 10);
+    }
+    // retangulo fora da tela e erro
+    let mut s = pseudo_script();
+    s.extend_from_slice(&[0, 0, 0, 1]);
+    s.extend(rect_hdr(3, 3, 2, 2, 0));
+    assert!(Client::new(Config::default()).feed(&s).is_err());
+}
+
+#[test]
+fn cursor_shape() {
+    let mut s = pseudo_script();
+    s.extend_from_slice(&[0, 0, 0, 1]);
+    s.extend(rect_hdr(1, 0, 2, 1, -239));
+    s.extend_from_slice(&[255, 0, 0, 0, 0, 255, 0, 0]);
+    s.push(0b1000_0000);
+    let mut c = Client::new(Config::default());
+    c.feed(&s).unwrap();
+    let ev: Vec<Event> = std::iter::from_fn(|| c.poll_event()).collect();
+    assert!(ev.contains(&Event::Cursor {
+        hot_x: 1,
+        hot_y: 0,
+        width: 2,
+        height: 1,
+        rgba: vec![255, 0, 0, 255, 0, 255, 0, 0],
+    }));
+    // cursor gigante e recusado
+    let mut s = pseudo_script();
+    s.extend_from_slice(&[0, 0, 0, 1]);
+    s.extend(rect_hdr(0, 0, 4000, 4000, -239));
+    assert!(Client::new(Config::default()).feed(&s).is_err());
 }

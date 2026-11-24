@@ -12,5 +12,13 @@ openvnc-core.workspace = true
 openvnc-framebuffer.workspace = true
 flate2.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+openvnc-platform.workspace = true
+
+[[bench]]
+name = "codecs"
+harness = false
+
 [lints]
 workspace = true

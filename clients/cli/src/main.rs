@@ -167,9 +167,13 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Screenshot { conn, output } => {
             let (sess, _, deadline) = connect(&conn, &rt)?;
+            // apos um resize o quadro e descartado; espera o update completo seguinte
+            let mut resized = false;
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 match sess.wait_event(left) {
+                    Some(SessionEvent::Resized { .. }) => resized = true,
+                    Some(SessionEvent::Updated) if resized => resized = false,
                     Some(SessionEvent::Updated) => break,
                     Some(SessionEvent::Disconnected { reason, .. }) => {
                         bail!("desconectado: {reason}")

@@ -86,6 +86,26 @@ pub enum SessionEvent {
     Bell,
     /// Clipboard remoto.
     CutText(String),
+    /// A tela remota mudou de tamanho (o quadro compartilhado foi recriado).
+    Resized {
+        /// Largura.
+        width: u16,
+        /// Altura.
+        height: u16,
+    },
+    /// Novo formato de cursor (RGBA, `width * height * 4` bytes).
+    Cursor {
+        /// Ponto quente x.
+        hot_x: u16,
+        /// Ponto quente y.
+        hot_y: u16,
+        /// Largura.
+        width: u16,
+        /// Altura.
+        height: u16,
+        /// Pixels.
+        rgba: Vec<u8>,
+    },
     /// Conexao perdida/encerrada.
     Disconnected {
         /// Motivo legivel.
@@ -319,8 +339,10 @@ fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) 
             });
         }
         Event::UpdateComplete => {
+            let mut changed = false;
             if let Some(src) = client.framebuffer_mut() {
                 let damage = src.take_damage();
+                changed = !damage.is_empty();
                 let mut f = ctx.frame.lock().expect("mutex");
                 if let Some(dst) = f.fb.as_mut() {
                     for r in &damage {
@@ -335,10 +357,39 @@ fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) 
                 }
             }
             client.request_incremental();
-            ctx.emit(SessionEvent::Updated);
+            // updates so com pseudo-encodings (cursor, tamanho) nao mudam pixels
+            if changed {
+                ctx.emit(SessionEvent::Updated);
+            }
         }
         Event::Bell => ctx.emit(SessionEvent::Bell),
         Event::CutText(t) => ctx.emit(SessionEvent::CutText(t)),
+        Event::Resized { width, height } => {
+            {
+                let mut f = ctx.frame.lock().expect("mutex");
+                f.fb = client.framebuffer().cloned();
+                f.damage = vec![Rect::new(0, 0, width, height)];
+                f.generation += 1;
+            }
+            if let Some(fb) = client.framebuffer_mut() {
+                fb.take_damage();
+            }
+            tracing::info!(width, height, "tela remota redimensionada");
+            ctx.emit(SessionEvent::Resized { width, height });
+        }
+        Event::Cursor {
+            hot_x,
+            hot_y,
+            width,
+            height,
+            rgba,
+        } => ctx.emit(SessionEvent::Cursor {
+            hot_x,
+            hot_y,
+            width,
+            height,
+            rgba,
+        }),
     }
 }
 

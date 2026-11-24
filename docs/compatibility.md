@@ -5,6 +5,7 @@
 | TigerVNC (Xvnc, Linux) | 3.3 / 3.7 / 3.8 | Verificado manualmente (ver abaixo); passos do job de CI `interop-tigervnc` executados em Ubuntu 24.04 (container) |
 | TightVNC (Xtightvnc 1.3, Linux) | 3.3 / 3.7 / 3.8 | Verificado: imagem, auth, teclado/mouse pela GUI; job de CI `interop-tightvnc` |
 | TightVNC 2.x (Windows) | 3.8 | Conecta, `info` e screenshot; a imagem veio preta (ver ressalva) |
+| openvnc-server (referência) | 3.8 | Verificado: vncviewer do TigerVNC a 30 FPS; job de CI `interop-reference` |
 | RealVNC | 3.8 | posterior |
 | x11vnc | 3.8 | planejado |
 | macOS Screen Sharing | 3.889 | planejado |
@@ -52,3 +53,9 @@
 | CPU com tela parada | ~0% | 0–31 ms de CPU em 10 s (com `xclock` ativo) |
 
 Com `OPENVNC_RENDERER=wgpu` (Vulkan) o uso sobe para cerca de 360 MB, quase tudo do driver. Por isso glow é o padrão.
+
+## Encodings do cliente (v0.2)
+
+- Raw, CopyRect, Hextile, ZRLE.
+- Tight: fill, basic com filtros copy/palette/gradient. **JPEG não é suportado** e por isso não é anunciado (sem `-32..-23`). O Xvnc foi verificado com Tight.
+- Pseudo-encodings: Cursor (-239), DesktopSize (-223) e ExtendedDesktopSize (-308). O redimensionamento via `xrandr` no Xvnc foi verificado.

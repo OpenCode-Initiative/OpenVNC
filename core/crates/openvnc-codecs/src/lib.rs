@@ -9,6 +9,11 @@ use flate2::{Decompress, FlushDecompress, Status};
 use openvnc_core::{check_limit, Error, PixelFormat, Rect, Result};
 use openvnc_framebuffer::Framebuffer;
 
+pub mod encode;
+mod tight;
+pub use encode::EncoderState;
+pub use tight::MAX_TIGHT_COMPRESSED;
+
 /// Versao do crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -22,6 +27,14 @@ pub mod encoding {
     pub const HEXTILE: i32 = 5;
     /// ZRLE.
     pub const ZRLE: i32 = 16;
+    /// Tight.
+    pub const TIGHT: i32 = 7;
+    /// Pseudo-encoding Cursor.
+    pub const CURSOR: i32 = -239;
+    /// Pseudo-encoding DesktopSize.
+    pub const DESKTOP_SIZE: i32 = -223;
+    /// Pseudo-encoding ExtendedDesktopSize.
+    pub const EXTENDED_DESKTOP_SIZE: i32 = -308;
 }
 
 /// Limite de bytes comprimidos por retangulo ZRLE.
@@ -39,12 +52,14 @@ pub struct Progress {
 /// Estado persistente por conexao (o stream zlib do ZRLE e unico).
 pub struct CodecState {
     zrle: Decompress,
+    tight: tight::TightState,
 }
 
 impl Default for CodecState {
     fn default() -> Self {
         CodecState {
             zrle: Decompress::new(true),
+            tight: tight::TightState::default(),
         }
     }
 }
@@ -68,6 +83,7 @@ enum Kind {
     CopyRect,
     Hextile(HextileState),
     Zrle,
+    Tight,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +101,7 @@ impl RectDecoder {
             encoding::COPY_RECT => Kind::CopyRect,
             encoding::HEXTILE => Kind::Hextile(HextileState::default()),
             encoding::ZRLE => Kind::Zrle,
+            encoding::TIGHT => Kind::Tight,
             other => return Err(Error::Unsupported(format!("encoding {other}"))),
         };
         Ok(RectDecoder { rect, kind })
@@ -118,6 +135,7 @@ impl RectDecoder {
             }
             Kind::Hextile(st) => decode_hextile(r, st, input, pf, fb),
             Kind::Zrle => decode_zrle(r, input, pf, fb, state),
+            Kind::Tight => tight::decode_tight(r, input, pf, fb, &mut state.tight),
         }
     }
 }
@@ -497,7 +515,7 @@ mod tests {
 
     #[test]
     fn unknown_encoding() {
-        assert!(RectDecoder::new(Rect::default(), 7).is_err());
+        assert!(RectDecoder::new(Rect::default(), 99).is_err());
     }
 
     #[test]

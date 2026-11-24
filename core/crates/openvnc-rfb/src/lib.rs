@@ -12,6 +12,9 @@ use openvnc_core::{check_limit, Error, KeyEvent, PixelFormat, PointerEvent, Rect
 use openvnc_framebuffer::Framebuffer;
 pub use openvnc_security::Password;
 
+pub mod server;
+pub use server::{Server, ServerConfig, ServerEvent};
+
 /// Versao do crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -123,15 +126,44 @@ pub enum Event {
     Bell,
     /// Clipboard do servidor (Latin-1 convertido).
     CutText(String),
+    /// O servidor mudou o tamanho da tela (DesktopSize/ExtendedDesktopSize).
+    /// O framebuffer foi recriado e uma atualizacao completa foi pedida.
+    Resized {
+        /// Largura nova.
+        width: u16,
+        /// Altura nova.
+        height: u16,
+    },
+    /// Formato do cursor (pseudo-encoding Cursor). `rgba` tem
+    /// `width * height * 4` bytes; alfa 0 onde a mascara e transparente.
+    Cursor {
+        /// Ponto quente x.
+        hot_x: u16,
+        /// Ponto quente y.
+        hot_y: u16,
+        /// Largura.
+        width: u16,
+        /// Altura.
+        height: u16,
+        /// Pixels RGBA.
+        rgba: Vec<u8>,
+    },
 }
 
 /// Encodings anunciados — apenas os implementados por completo.
-pub const ANNOUNCED_ENCODINGS: [i32; 4] = [
+pub const ANNOUNCED_ENCODINGS: [i32; 8] = [
     encoding::ZRLE,
+    encoding::TIGHT,
     encoding::HEXTILE,
     encoding::COPY_RECT,
     encoding::RAW,
+    encoding::CURSOR,
+    encoding::EXTENDED_DESKTOP_SIZE,
+    encoding::DESKTOP_SIZE,
 ];
+
+/// Maior cursor aceito (lado).
+const MAX_CURSOR: u16 = 256;
 
 #[derive(Debug)]
 enum State {
@@ -144,8 +176,18 @@ enum State {
     ServerInit,
     MessageType,
     UpdateHeader,
-    RectHeader { remaining: u16 },
-    RectData { remaining: u16, dec: RectDecoder },
+    RectHeader {
+        remaining: u16,
+    },
+    RectData {
+        remaining: u16,
+        dec: RectDecoder,
+    },
+    Pseudo {
+        remaining: u16,
+        rect: Rect,
+        enc: i32,
+    },
     ColourMap,
     CutText,
     Failed,
@@ -433,8 +475,70 @@ impl Client {
                 if !ANNOUNCED_ENCODINGS.contains(&enc) {
                     return Err(Error::Protocol(format!("encoding nao anunciado {enc}")));
                 }
+                if enc < 0 {
+                    return Ok((
+                        State::Pseudo {
+                            remaining,
+                            rect: r,
+                            enc,
+                        },
+                        Some(12),
+                    ));
+                }
+                let fb = self.fb.as_ref().expect("fb existe apos ServerInit");
+                if r.clip_to(fb.width(), fb.height()) != r {
+                    return Err(Error::Protocol(format!("retangulo fora da tela {r:?}")));
+                }
                 let dec = RectDecoder::new(r, enc)?;
                 Ok((State::RectData { remaining, dec }, Some(12)))
+            }
+            State::Pseudo {
+                remaining,
+                rect,
+                enc,
+            } => {
+                let used = match enc {
+                    encoding::CURSOR => {
+                        let Some(n) = self.cursor(rect, b)? else {
+                            wait!(State::Pseudo {
+                                remaining,
+                                rect,
+                                enc
+                            });
+                        };
+                        n
+                    }
+                    encoding::DESKTOP_SIZE => {
+                        self.resize(rect.width, rect.height)?;
+                        0
+                    }
+                    _ => {
+                        // ExtendedDesktopSize: n telas, 3 de padding, 16*n
+                        if !self.need(b, 4) {
+                            wait!(State::Pseudo {
+                                remaining,
+                                rect,
+                                enc
+                            });
+                        }
+                        let total = 4 + 16 * usize::from(b[0]);
+                        if !self.need(b, total) {
+                            wait!(State::Pseudo {
+                                remaining,
+                                rect,
+                                enc
+                            });
+                        }
+                        // y = codigo de status; != 0 e recusa de um pedido nosso
+                        if rect.y == 0 {
+                            self.resize(rect.width, rect.height)?;
+                        } else {
+                            tracing::debug!(status = rect.y, "ExtendedDesktopSize recusado");
+                        }
+                        total
+                    }
+                };
+                Ok((self.rect_done(remaining), Some(used)))
             }
             State::RectData { remaining, mut dec } => {
                 let fb = self.fb.as_mut().expect("fb existe apos ServerInit");
@@ -443,14 +547,7 @@ impl Client {
                     let used = (p.consumed > 0).then_some(p.consumed);
                     return Ok((State::RectData { remaining, dec }, used));
                 }
-                let left = remaining - 1;
-                let next = if left == 0 {
-                    self.events.push_back(Event::UpdateComplete);
-                    State::MessageType
-                } else {
-                    State::RectHeader { remaining: left }
-                };
-                Ok((next, Some(p.consumed)))
+                Ok((self.rect_done(remaining), Some(p.consumed)))
             }
             State::ColourMap => {
                 if !self.need(b, 5) {
@@ -505,6 +602,71 @@ impl Client {
     fn send_set_pixel_format(&mut self) {
         self.out.extend_from_slice(&[0, 0, 0, 0]);
         self.out.extend_from_slice(&self.pf.to_bytes());
+    }
+
+    fn rect_done(&mut self, remaining: u16) -> State {
+        let left = remaining - 1;
+        if left == 0 {
+            self.events.push_back(Event::UpdateComplete);
+            State::MessageType
+        } else {
+            State::RectHeader { remaining: left }
+        }
+    }
+
+    fn resize(&mut self, w: u16, h: u16) -> Result<()> {
+        let max = u64::from(self.cfg.max_dimension);
+        check_limit("framebuffer width", u64::from(w), max)?;
+        check_limit("framebuffer height", u64::from(h), max)?;
+        if self
+            .fb
+            .as_ref()
+            .is_some_and(|f| (f.width(), f.height()) == (w, h))
+        {
+            return Ok(());
+        }
+        self.fb = Some(Framebuffer::new(w, h, self.cfg.max_fb_bytes)?);
+        self.events.push_back(Event::Resized {
+            width: w,
+            height: h,
+        });
+        self.request_update(false, Rect::new(0, 0, w, h));
+        Ok(())
+    }
+
+    /// Decodifica o pseudo-retangulo Cursor; `None` se faltam bytes.
+    fn cursor(&mut self, r: Rect, b: &[u8]) -> Result<Option<usize>> {
+        check_limit("cursor width", u64::from(r.width), u64::from(MAX_CURSOR))?;
+        check_limit("cursor height", u64::from(r.height), u64::from(MAX_CURSOR))?;
+        let (w, h) = (usize::from(r.width), usize::from(r.height));
+        let bpp = usize::from(self.pf.bits_per_pixel / 8);
+        let mask_row = w.div_ceil(8);
+        let total = w * h * bpp + mask_row * h;
+        if !self.need(b, total) {
+            return Ok(None);
+        }
+        let (px, mask) = b[..total].split_at(w * h * bpp);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * bpp;
+                let mut c = self.pf.to_rgba(self.pf.read_pixel(&px[i..i + bpp]));
+                c[3] = if mask[y * mask_row + x / 8] & (0x80 >> (x % 8)) != 0 {
+                    255
+                } else {
+                    0
+                };
+                rgba.extend(c);
+            }
+        }
+        self.events.push_back(Event::Cursor {
+            hot_x: r.x,
+            hot_y: r.y,
+            width: r.width,
+            height: r.height,
+            rgba,
+        });
+        Ok(Some(total))
     }
 
     fn send_set_encodings(&mut self) {

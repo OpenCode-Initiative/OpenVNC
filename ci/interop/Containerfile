@@ -1,0 +1,6 @@
+# Interop: TigerVNC vncviewer contra o openvnc-server e o cliente
+# OpenVNC contra o Xvnc (Tight, Cursor, ExtendedDesktopSize), tudo em Xvfb.
+FROM docker.io/library/rust:1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      xvfb tigervnc-viewer tigervnc-tools tigervnc-standalone-server imagemagick x11-apps x11-xserver-utils procps xdotool \
+    && rm -rf /var/lib/apt/lists/*

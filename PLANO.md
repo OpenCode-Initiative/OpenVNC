@@ -74,6 +74,13 @@ Ordem de execução (cada item com testes por fixtures de bytes):
 
 **Aceite:** TigerVNC viewer conecta ao servidor de referência; animação simples a 30 FPS com baixo CPU.
 
+**Status v0.2:** concluída. Aceite verificado em Xvfb (job `interop-reference`): o vncviewer do TigerVNC recebe o test-pattern a 29,9 FPS com ~3,5% de CPU no servidor.
+
+- Backends: test-pattern (todas as plataformas), X11 (GetImage + XTest, sem `unsafe`) e Windows (GDI BitBlt + SendInput, com `unsafe` isolado no módulo). Ficam para depois: DXGI Desktop Duplication, Wayland (portal/PipeWire) e macOS.
+- Cliente: Tight (sem JPEG), Cursor, DesktopSize e ExtendedDesktopSize; testado contra o Xvnc, inclusive `xrandr`.
+- Benchmarks (`cargo bench -p openvnc-codecs`, 1280x720): encode raw 2,4 ms / hextile 2,5 ms / zrle 3,2 ms; decode 0,94 / 0,15 / 1,37 ms.
+- Renderer nativo (`OPENVNC_RENDERER=native openvnc-desktop host`): winit + softbuffer, sem GL. Mediu 24 MB de working set e 12 MB privados no Windows com animação, contra 98–111 MB do glow. A GUI de conexão continua em egui.
+
 ## Fase 3 — v0.3 Segurança e transporte moderno
 
 1. TLS 1.3 (rustls) e VeNCrypt para servidores que suportam; validação estrita de certificado; pinning/TOFU para auto-assinados; **sem downgrade silencioso**.

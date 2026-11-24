@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod input;
+mod native;
 
 use std::sync::Arc;
 
@@ -16,6 +17,18 @@ fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    // `openvnc-desktop [host]` conecta direto (senha via OPENVNC_PASSWORD)
+    let target = std::env::args().nth(1);
+    if std::env::var("OPENVNC_RENDERER").as_deref() == Ok("native") {
+        if let Some(t) = &target {
+            if let Err(e) = run_native_renderer(t) {
+                eprintln!("openvnc-desktop: {e:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        tracing::warn!("renderer nativo exige host na linha de comando; usando glow");
+    }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("OpenVNC")
@@ -28,8 +41,6 @@ fn main() -> eframe::Result<()> {
         },
         ..Default::default()
     };
-    // `openvnc-desktop [host]` conecta direto (senha via OPENVNC_PASSWORD)
-    let target = std::env::args().nth(1);
     eframe::run_native(
         "OpenVNC",
         opts,
@@ -45,6 +56,14 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn run_native_renderer(host: &str) -> anyhow::Result<()> {
+    let mut o = ConnectOptions::new(openvnc_transport::parse_address(host)?);
+    if let Ok(p) = std::env::var("OPENVNC_PASSWORD") {
+        o.config.password = Some(Password::new(p));
+    }
+    native::run(o)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -65,6 +84,8 @@ struct Remote {
     keys: input::KeyState,
     buttons: u8,
     last_pos: (u16, u16),
+    /// Cursor remoto (textura, ponto quente).
+    cursor: Option<(egui::TextureHandle, egui::Vec2)>,
 }
 
 struct App {
@@ -122,6 +143,7 @@ impl App {
             keys: input::KeyState::default(),
             buttons: 0,
             last_pos: (0, 0),
+            cursor: None,
         });
     }
 
@@ -199,6 +221,25 @@ impl eframe::App for App {
                     };
                 }
                 SessionEvent::CutText(t) => ctx.copy_text(t),
+                SessionEvent::Cursor {
+                    hot_x,
+                    hot_y,
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    remote.cursor = (width > 0 && height > 0).then(|| {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [usize::from(width), usize::from(height)],
+                            &rgba,
+                        );
+                        let tex = ctx.load_texture("cursor", img, egui::TextureOptions::NEAREST);
+                        (tex, egui::vec2(f32::from(hot_x), f32::from(hot_y)))
+                    });
+                }
+                SessionEvent::Resized { width, height } => {
+                    remote.status = format!("{width}x{height}");
+                }
                 SessionEvent::Bell | SessionEvent::Updated => {}
             }
         }
@@ -253,6 +294,19 @@ impl eframe::App for App {
                     );
                     if remote.connected {
                         handle_input(ui, remote, rect, size, &resp);
+                    }
+                    // cursor remoto (pseudo-encoding Cursor) desenhado localmente
+                    if let (Some((cur, hot)), Some(pos)) = (&remote.cursor, resp.hover_pos()) {
+                        let min = pos - *hot * k;
+                        ui.painter().image(
+                            cur.id(),
+                            egui::Rect::from_min_size(min, cur.size_vec2() * k),
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                        if cur.size_vec2().x > 0.0 {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                        }
                     }
                 };
                 match scale {

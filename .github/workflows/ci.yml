@@ -123,3 +123,16 @@ jobs:
           if echo errada | cargo run -p openvnc-cli -- info localhost:4 --password-stdin; then
             echo "senha errada foi aceita"; exit 1
           fi
+
+  interop-reference:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            xvfb tigervnc-viewer tigervnc-tools tigervnc-standalone-server \
+            imagemagick x11-apps x11-xserver-utils procps xdotool
+      - run: cargo build --release -p openvnc-server -p openvnc-cli
+      - name: TigerVNC viewer x openvnc-server; openvnc x Xvnc
+        run: BIN=target/release/openvnc-server CLI=target/release/openvnc bash ci/interop/run.sh

@@ -22,12 +22,12 @@ async fn fake_server(listener: TcpListener, drop_after_first: bool) {
         init.extend_from_slice(&1u32.to_be_bytes());
         init.push(b'x');
         s.write_all(&init).await.unwrap();
-        // SetPixelFormat(20) + SetEncodings(4+16) + FBUpdateRequest(10)
-        let mut m = [0u8; 50];
+        // SetPixelFormat(20) + SetEncodings(4+32) + FBUpdateRequest(10)
+        let mut m = [0u8; 66];
         s.read_exact(&mut m).await.unwrap();
         assert_eq!(m[0], 0);
         assert_eq!(m[20], 2);
-        assert_eq!(m[40], 3);
+        assert_eq!(m[56], 3);
         let mut upd = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1];
         upd.extend_from_slice(&0i32.to_be_bytes());
         upd.extend_from_slice(&[200, 100, 50, 0]);

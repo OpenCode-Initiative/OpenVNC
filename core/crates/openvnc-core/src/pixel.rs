@@ -174,6 +174,54 @@ impl PixelFormat {
             v << 8
         }
     }
+
+    /// Converte RGBA8 em um pixel inteiro neste formato (inverso de
+    /// [`PixelFormat::to_rgba`]; o alfa e ignorado).
+    #[inline]
+    pub fn from_rgba(&self, c: [u8; 4]) -> u32 {
+        #[inline]
+        fn comp(v: u8, shift: u8, max: u16) -> u32 {
+            let m = u32::from(max);
+            let v = if max == 255 {
+                u32::from(v)
+            } else {
+                (u32::from(v) * m + 127) / 255
+            };
+            v.checked_shl(u32::from(shift)).unwrap_or(0)
+        }
+        comp(c[0], self.red_shift, self.red_max)
+            | comp(c[1], self.green_shift, self.green_max)
+            | comp(c[2], self.blue_shift, self.blue_max)
+    }
+
+    /// Escreve um pixel (`bytes_per_pixel` bytes) em `out`.
+    #[inline]
+    pub fn write_pixel(&self, p: u32, out: &mut Vec<u8>) {
+        match (self.bits_per_pixel, self.big_endian) {
+            (8, _) => out.push(p as u8),
+            (16, false) => out.extend_from_slice(&(p as u16).to_le_bytes()),
+            (16, true) => out.extend_from_slice(&(p as u16).to_be_bytes()),
+            (_, false) => out.extend_from_slice(&p.to_le_bytes()),
+            (_, true) => out.extend_from_slice(&p.to_be_bytes()),
+        }
+    }
+
+    /// Escreve um CPIXEL (ZRLE/Tight) em `out`.
+    #[inline]
+    pub fn write_cpixel(&self, p: u32, out: &mut Vec<u8>) {
+        if self.cpixel_len() != 3 {
+            return self.write_pixel(p, out);
+        }
+        let mask = (u32::from(self.red_max) << self.red_shift)
+            | (u32::from(self.green_max) << self.green_shift)
+            | (u32::from(self.blue_max) << self.blue_shift);
+        let v = if mask & 0xFF00_0000 == 0 { p } else { p >> 8 };
+        if self.big_endian {
+            out.extend_from_slice(&v.to_be_bytes()[1..]);
+        } else {
+            out.extend_from_slice(&v.to_le_bytes()[..3]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +266,32 @@ mod tests {
         let pf = PixelFormat::RGBX8888;
         assert_eq!(pf.cpixel_len(), 3);
         assert_eq!(pf.to_rgba(pf.read_cpixel(&[9, 8, 7])), [9, 8, 7, 255]);
+    }
+
+    #[test]
+    fn encode_roundtrip() {
+        let rgb565 = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian: true,
+            true_colour: true,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
+        for pf in [PixelFormat::RGBX8888, rgb565] {
+            for c in [[0, 0, 0, 255], [255, 255, 255, 255], [255, 0, 0, 255]] {
+                let mut b = Vec::new();
+                pf.write_pixel(pf.from_rgba(c), &mut b);
+                assert_eq!(b.len(), pf.bytes_per_pixel());
+                assert_eq!(pf.to_rgba(pf.read_pixel(&b)), c);
+                let mut cb = Vec::new();
+                pf.write_cpixel(pf.from_rgba(c), &mut cb);
+                assert_eq!(pf.to_rgba(pf.read_cpixel(&cb)), c);
+            }
+        }
     }
 }

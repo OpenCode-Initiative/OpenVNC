@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core/crates/*", "clients/*"]
+members = ["core/crates/*", "clients/*", "servers/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -19,6 +19,7 @@ openvnc-codecs = { path = "core/crates/openvnc-codecs", version = "0.0.1" }
 openvnc-rfb = { path = "core/crates/openvnc-rfb", version = "0.0.1" }
 openvnc-security = { path = "core/crates/openvnc-security", version = "0.0.1" }
 openvnc-transport = { path = "core/crates/openvnc-transport", version = "0.0.1" }
+openvnc-platform = { path = "core/crates/openvnc-platform", version = "0.0.1" }
 openvnc-client = { path = "core/crates/openvnc-client", version = "0.0.1" }
 flate2 = "1"
 des = "0.8"
@@ -28,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 png = "0.17"
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { version = "0.5", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

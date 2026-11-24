@@ -1,0 +1,32 @@
+[package]
+name = "openvnc-server"
+description = "Servidor RFB 3.8 de referencia do OpenVNC."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "openvnc-server"
+path = "src/main.rs"
+
+[dependencies]
+openvnc-core.workspace = true
+openvnc-framebuffer.workspace = true
+openvnc-codecs.workspace = true
+openvnc-rfb.workspace = true
+openvnc-platform.workspace = true
+openvnc-security.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+getrandom = "0.2"
+
+[lints]
+workspace = true
