@@ -70,11 +70,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz build
+      - run: cargo +nightly install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
       - run: |
-          cargo fuzz run rfb_feed -- -max_total_time=60
-          cargo fuzz run codecs -- -max_total_time=60
+          cargo +nightly fuzz run rfb_feed -- -max_total_time=60
+          cargo +nightly fuzz run codecs -- -max_total_time=60
 
   interop-tigervnc:
     runs-on: ubuntu-latest
