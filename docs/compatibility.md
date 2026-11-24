@@ -32,6 +32,7 @@
 - Contra TightVNC e TigerVNC, `Via GUI: Xyz 42 #&*{}`, Return e Ctrl+U chegaram corretos ao xterm remoto.
 - O Ctrl+U apagou a linha, o que confirma que os modificadores funcionam.
 - A renderização local confere com a captura do servidor.
+- No Windows 11, com entrada sintética do sistema (SendInput/SendKeys) na janela do OpenVNC, `WinTeste 42 #&` + Enter chegou correto ao xterm do TigerVNC.
 
 **Fuzzing:** os passos do job `fuzz-build` rodaram com nightly e cargo-fuzz 0.13.2. Sem crashes em 60 s por alvo (`rfb_feed`: 977 mil execuções; `codecs`: 1,88 milhão).
 
