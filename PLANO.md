@@ -110,6 +110,19 @@ Ordem de execução (cada item com testes por fixtures de bytes):
   Conclusão: **em loopback o QUIC não traz ganho**; custa CPU e vazão. Não foi medido em rede real com perda e latência, onde o benefício esperado (sem head-of-line blocking entre streams) apareceria. Também não há o teste equivalente de "entrada sob carga" em TCP, porque falta o framing próprio, que fica para a Fase 4.
 - Pendências: o cliente desktop compila com TLS, mas ainda não tem UI para pin/TOFU; o listener QUIC fica para quando houver protocolo nativo.
 
+## Progresso consolidado (após a v0.3)
+
+Fases 0 a 3 entregues (detalhes nos status acima). Pendências abertas antes ou junto da Fase 4:
+
+- **Desktop:** UI para TLS (pin, TOFU, usuário/dispositivo); hoje só a CLI expõe isso.
+- **QUIC:** ligar ao servidor/cliente (junto do protocolo nativo) e medir em rede real com perda/latência; em loopback perdeu para TCP.
+- **CI:** os jobs `interop-reference`, `wayland` e `interop-tls` passaram em container local, mas ainda não rodaram no GitHub.
+- **macOS:** só compilado; migrar para ScreenCaptureKit e testar permissões num Mac.
+- **Wayland:** portal com quadros reais e entrada RemoteDesktop (precisa de GNOME/KDE com GPU).
+- **X11:** MIT-SHM/Damage em vez de GetImage do quadro inteiro.
+- **Cliente:** JPEG no Tight.
+- **Renderer próprio:** backends por SO (GDI/Direct2D, X11 SHM, wl_shm, CALayer), ver [docs/renderer-proprio.md](docs/renderer-proprio.md).
+
 ## Fase 4 — v0.4 Protocolo nativo OpenVNC
 
 1. Especificação em `docs/RFC/` (linguagem normativa, versionada): header `Version(2) Type(2) Flags(2) Length(4)` big-endian; mensagens CLIENT_HELLO…CLOSE; negociação explícita de capabilities; limites de tamanho. Revisão pública antes de congelar códigos.
