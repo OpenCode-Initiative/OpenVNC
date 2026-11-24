@@ -11,7 +11,8 @@ use std::time::Duration;
 use openvnc_core::{Error, KeyEvent, PointerEvent, Rect, Result};
 use openvnc_framebuffer::Framebuffer;
 use openvnc_rfb::{Client, Config, Event, ProtocolVersion};
-use openvnc_transport::{connect_tcp, Backoff};
+use openvnc_transport::tls::{host_of, ClientTls};
+use openvnc_transport::{connect_tcp, Backoff, BoxStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc as tmpsc;
 
@@ -33,6 +34,9 @@ pub struct ConnectOptions {
     pub reconnect: bool,
     /// Politica de backoff.
     pub backoff: Backoff,
+    /// TLS (VeNCrypt). `Some` implica `config.require_tls`: sem fallback
+    /// para conexao em claro.
+    pub tls: Option<ClientTls>,
 }
 
 impl ConnectOptions {
@@ -45,6 +49,7 @@ impl ConnectOptions {
             handshake_timeout: Duration::from_secs(10),
             reconnect: true,
             backoff: Backoff::default(),
+            tls: None,
         }
     }
 }
@@ -75,7 +80,7 @@ pub enum SessionEvent {
         name: String,
         /// Versao RFB.
         version: ProtocolVersion,
-        /// Transporte criptografado? Sempre `false` na v0.1.
+        /// Transporte criptografado (VeNCrypt/TLS 1.3)?
         encrypted: bool,
         /// Autenticacao legada VNC Auth (DES) foi usada.
         legacy_auth: bool,
@@ -275,8 +280,16 @@ async fn drive(
     ctx: &Ctx,
     connected: &mut bool,
 ) -> Result<()> {
-    let mut stream = connect_tcp(&opts.address, opts.connect_timeout).await?;
-    let mut client = Client::new(opts.config.clone());
+    let mut stream: BoxStream = Box::new(connect_tcp(&opts.address, opts.connect_timeout).await?);
+    let mut cfg = opts.config.clone();
+    if opts.tls.is_some() {
+        cfg.require_tls = true;
+    }
+    if cfg.require_tls && opts.tls.is_none() {
+        return Err(Error::Protocol("require_tls sem configuracao TLS".into()));
+    }
+    let mut client = Client::new(cfg);
+    let mut start_tls = false;
     let mut buf = vec![0u8; 64 * 1024];
     let deadline = tokio::time::Instant::now() + opts.handshake_timeout;
     loop {
@@ -288,7 +301,11 @@ async fn drive(
                 }
                 client.feed(&buf[..n])?;
                 while let Some(e) = client.poll_event() {
-                    handle_event(e, &mut client, ctx, connected);
+                    if e == Event::StartTls {
+                        start_tls = true;
+                    } else {
+                        handle_event(e, &mut client, ctx, connected);
+                    }
                 }
             }
             c = cmds.recv() => match c {
@@ -305,6 +322,26 @@ async fn drive(
         let out = client.take_output();
         if !out.is_empty() {
             stream.write_all(&out).await?;
+        }
+        if std::mem::take(&mut start_tls) {
+            let tls = opts.tls.as_ref().expect("checado acima");
+            stream.flush().await?;
+            let host = host_of(&opts.address).to_string();
+            let fut = tls.connect(stream, &host, &opts.address);
+            stream = Box::new(
+                tokio::time::timeout_at(deadline, fut)
+                    .await
+                    .map_err(|_| Error::Protocol("timeout no handshake TLS".into()))??,
+            );
+            tracing::info!(subtype = ?client.tls_subtype(), "TLS 1.3 estabelecido");
+            client.tls_established()?;
+            while let Some(e) = client.poll_event() {
+                handle_event(e, &mut client, ctx, connected);
+            }
+            let out = client.take_output();
+            if !out.is_empty() {
+                stream.write_all(&out).await?;
+            }
         }
     }
 }
@@ -334,8 +371,9 @@ fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) 
                 height,
                 name,
                 version,
-                encrypted: false,
-                legacy_auth: security == openvnc_rfb::security_type::VNC_AUTH,
+                encrypted: client.tls_subtype().is_some(),
+                legacy_auth: security == openvnc_rfb::security_type::VNC_AUTH
+                    || client.tls_subtype() == Some(openvnc_rfb::vencrypt::X509_VNC),
             });
         }
         Event::UpdateComplete => {
@@ -362,6 +400,7 @@ fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) 
                 ctx.emit(SessionEvent::Updated);
             }
         }
+        Event::StartTls => {} // tratado em drive
         Event::Bell => ctx.emit(SessionEvent::Bell),
         Event::CutText(t) => ctx.emit(SessionEvent::CutText(t)),
         Event::Resized { width, height } => {

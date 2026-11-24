@@ -11,7 +11,25 @@ use openvnc_core::{check_limit, Error, KeyEvent, PixelFormat, PointerEvent, Rect
 use openvnc_framebuffer::Framebuffer;
 use openvnc_security::{vnc_auth_response, Password};
 
-use crate::{be16, be32, latin1, security_type, ProtocolVersion};
+use crate::{be16, be32, latin1, security_type, vencrypt, ProtocolVersion};
+
+/// Verificador de usuario/senha do VeNCrypt X509Plain
+/// (`(usuario, senha) -> aceito`). No servidor de referencia consulta o
+/// armazenamento de dispositivos pareados.
+#[derive(Clone)]
+pub struct PlainVerifier(pub std::sync::Arc<PlainFn>);
+
+/// `(usuario, senha) -> aceito?`
+pub type PlainFn = dyn Fn(&str, &[u8]) -> bool + Send + Sync;
+
+impl std::fmt::Debug for PlainVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PlainVerifier(..)")
+    }
+}
+
+/// Limite de usuario/senha no X509Plain.
+const MAX_PLAIN_FIELD: u32 = 1024;
 
 /// Configuracao do servidor por conexao.
 #[derive(Debug, Clone)]
@@ -28,6 +46,12 @@ pub struct ServerConfig {
     pub max_cut_text: u32,
     /// Limite de encodings no SetEncodings.
     pub max_encodings: u16,
+    /// Oferecer VeNCrypt (o driver precisa ter uma identidade TLS).
+    pub vencrypt: bool,
+    /// Oferecer **somente** VeNCrypt: tipos sem TLS nao sao anunciados.
+    pub require_tls: bool,
+    /// Habilita o sub-tipo X509Plain (usuario/senha dentro do TLS).
+    pub plain: Option<PlainVerifier>,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +63,9 @@ impl Default for ServerConfig {
             challenge: [0; 16],
             max_cut_text: 1024 * 1024,
             max_encodings: 1024,
+            vencrypt: false,
+            require_tls: false,
+            plain: None,
         }
     }
 }
@@ -55,6 +82,16 @@ pub enum ServerEvent {
     },
     /// Autenticacao recusada (a conexao deve ser fechada apos enviar a saida).
     AuthFailed,
+    /// VeNCrypt negociado: o driver envia `take_output`, faz o handshake
+    /// TLS (lado servidor) e chama [`Server::tls_established`].
+    StartTls,
+    /// Tentativa de login X509Plain (para auditoria).
+    PlainLogin {
+        /// Usuario informado.
+        username: String,
+        /// Aceito pelo verificador.
+        accepted: bool,
+    },
     /// Novo formato de pixel.
     PixelFormatChanged(PixelFormat),
     /// Lista de encodings do cliente.
@@ -79,6 +116,10 @@ enum SState {
     Version,
     SecurityChoice,
     VncResponse,
+    VeVersion,
+    VeSubtype,
+    TlsPending,
+    PlainCreds,
     ClientInit,
     MessageType,
     Failed,
@@ -98,13 +139,22 @@ pub struct Server {
     width: u16,
     height: u16,
     enc: EncoderState,
+    subtype: Option<u32>,
 }
 
 impl Server {
     /// Cria o servidor e ja enfileira o banner `RFB 003.008`.
     /// Falha se nao houver senha nem `allow_no_auth`.
     pub fn new(cfg: ServerConfig, width: u16, height: u16) -> Result<Self> {
-        if cfg.password.is_none() && !cfg.allow_no_auth {
+        if cfg.require_tls && !cfg.vencrypt {
+            return Err(Error::Protocol("require_tls exige vencrypt".into()));
+        }
+        if cfg.plain.is_some() && !cfg.vencrypt {
+            return Err(Error::Protocol(
+                "X509Plain so existe dentro do VeNCrypt".into(),
+            ));
+        }
+        if cfg.password.is_none() && !cfg.allow_no_auth && cfg.plain.is_none() {
             return Err(Error::Protocol(
                 "servidor sem senha exige allow_no_auth".into(),
             ));
@@ -121,6 +171,7 @@ impl Server {
             width,
             height,
             enc: EncoderState::default(),
+            subtype: None,
         })
     }
 
@@ -201,8 +252,52 @@ impl Server {
         0
     }
 
+    /// Sub-tipo VeNCrypt em uso (`None` = sem TLS).
+    pub fn tls_subtype(&self) -> Option<u32> {
+        self.subtype
+    }
+
+    /// Chamado pelo driver quando o handshake TLS terminou.
+    pub fn tls_established(&mut self) -> Result<()> {
+        if self.state != SState::TlsPending {
+            return Err(Error::Protocol("tls_established fora de hora".into()));
+        }
+        self.state = match self.subtype {
+            Some(vencrypt::X509_VNC) => {
+                self.out.extend_from_slice(&self.cfg.challenge);
+                SState::VncResponse
+            }
+            Some(vencrypt::X509_PLAIN) => SState::PlainCreds,
+            _ => {
+                self.out.extend_from_slice(&0u32.to_be_bytes());
+                SState::ClientInit
+            }
+        };
+        self.feed(&[])
+    }
+
+    fn subtypes(&self) -> Vec<u32> {
+        let mut v = Vec::new();
+        if self.cfg.plain.is_some() {
+            v.push(vencrypt::X509_PLAIN);
+        }
+        if self.cfg.password.is_some() {
+            v.push(vencrypt::X509_VNC);
+        }
+        if self.cfg.allow_no_auth {
+            v.push(vencrypt::X509_NONE);
+        }
+        v
+    }
+
     fn offered(&self) -> Vec<u8> {
         let mut v = Vec::new();
+        if self.cfg.vencrypt {
+            v.push(security_type::VENCRYPT);
+        }
+        if self.cfg.require_tls {
+            return v;
+        }
         if self.cfg.password.is_some() {
             v.push(security_type::VNC_AUTH);
         }
@@ -213,7 +308,10 @@ impl Server {
     }
 
     fn start_security(&mut self, t: u8) {
-        if t == security_type::VNC_AUTH {
+        if t == security_type::VENCRYPT {
+            self.out.extend_from_slice(&[0, 2]);
+            self.state = SState::VeVersion;
+        } else if t == security_type::VNC_AUTH {
             self.out.extend_from_slice(&self.cfg.challenge);
             self.state = SState::VncResponse;
         } else {
@@ -235,8 +333,16 @@ impl Server {
                 self.version = ProtocolVersion::negotiate(&banner)?;
                 let offered = self.offered();
                 if self.version == ProtocolVersion::V3_3 {
-                    // 3.3: o servidor escolhe o tipo (u32)
-                    let t = offered[0];
+                    // 3.3: o servidor escolhe o tipo (u32); VeNCrypt nao
+                    // existe no 3.3
+                    let Some(&t) = offered.iter().find(|t| **t != security_type::VENCRYPT) else {
+                        self.out.extend_from_slice(&0u32.to_be_bytes());
+                        let r = "TLS obrigatorio; cliente RFB 3.3 recusado";
+                        self.out.extend_from_slice(&(r.len() as u32).to_be_bytes());
+                        self.out.extend_from_slice(r.as_bytes());
+                        self.state = SState::Failed;
+                        return Err(Error::Unsupported(r.into()));
+                    };
                     self.out.extend_from_slice(&u32::from(t).to_be_bytes());
                     self.start_security(t);
                 } else {
@@ -278,6 +384,78 @@ impl Server {
                 self.out.extend_from_slice(&0u32.to_be_bytes());
                 self.state = SState::ClientInit;
                 Ok(16)
+            }
+            SState::VeVersion => {
+                if b.len() < 2 {
+                    return Ok(0);
+                }
+                if (b[0], b[1]) != (0, 2) {
+                    self.out.push(255);
+                    self.state = SState::Failed;
+                    return Err(Error::Unsupported(format!(
+                        "VeNCrypt {}.{} do cliente",
+                        b[0], b[1]
+                    )));
+                }
+                let subs = self.subtypes();
+                self.out.push(0);
+                self.out.push(subs.len() as u8);
+                for t in subs {
+                    self.out.extend_from_slice(&t.to_be_bytes());
+                }
+                self.state = SState::VeSubtype;
+                Ok(2)
+            }
+            SState::VeSubtype => {
+                if b.len() < 4 {
+                    return Ok(0);
+                }
+                let t = be32(b);
+                if !self.subtypes().contains(&t) {
+                    self.out.push(0);
+                    self.events.push_back(ServerEvent::AuthFailed);
+                    self.state = SState::Failed;
+                    return Err(Error::Protocol(format!("sub-tipo VeNCrypt {t} recusado")));
+                }
+                self.out.push(1);
+                self.subtype = Some(t);
+                self.events.push_back(ServerEvent::StartTls);
+                self.state = SState::TlsPending;
+                Ok(4)
+            }
+            SState::TlsPending => {
+                if b.is_empty() {
+                    Ok(0)
+                } else {
+                    Err(Error::Protocol("dados antes do handshake TLS".into()))
+                }
+            }
+            SState::PlainCreds => {
+                if b.len() < 8 {
+                    return Ok(0);
+                }
+                let ulen = be32(b);
+                let plen = be32(&b[4..]);
+                check_limit("usuario", u64::from(ulen), u64::from(MAX_PLAIN_FIELD))?;
+                check_limit("senha", u64::from(plen), u64::from(MAX_PLAIN_FIELD))?;
+                let total = 8 + ulen as usize + plen as usize;
+                if b.len() < total {
+                    return Ok(0);
+                }
+                let user = String::from_utf8_lossy(&b[8..8 + ulen as usize]).into_owned();
+                let pass = &b[8 + ulen as usize..total];
+                let ok = self.cfg.plain.as_ref().is_some_and(|v| (v.0)(&user, pass));
+                self.events.push_back(ServerEvent::PlainLogin {
+                    username: user,
+                    accepted: ok,
+                });
+                if !ok {
+                    self.fail_auth("autenticacao falhou");
+                    return Err(Error::Protocol("autenticacao falhou".into()));
+                }
+                self.out.extend_from_slice(&0u32.to_be_bytes());
+                self.state = SState::ClientInit;
+                Ok(total)
             }
             SState::ClientInit => {
                 let Some(&shared) = b.first() else {
@@ -490,6 +668,151 @@ mod tests {
             ..Default::default()
         });
         (c, s)
+    }
+
+    /// Simula o TLS: bytes passam direto; nos eventos StartTls os dois lados
+    /// sao "promovidos".
+    fn pump_tls(c: &mut Client, s: &mut Server) -> Vec<ServerEvent> {
+        let mut sev = Vec::new();
+        let (mut ctls, mut stls) = (false, false);
+        for _ in 0..40 {
+            let a = s.take_output();
+            if !a.is_empty() && c.feed(&a).is_err() {
+                break;
+            }
+            while let Some(e) = c.poll_event() {
+                if e == Event::StartTls {
+                    ctls = true;
+                }
+            }
+            let b = c.take_output();
+            if !b.is_empty() {
+                let _ = s.feed(&b);
+            }
+            while let Some(e) = s.poll_event() {
+                if e == ServerEvent::StartTls {
+                    stls = true;
+                }
+                sev.push(e);
+            }
+            if ctls && stls {
+                ctls = false;
+                stls = false;
+                s.tls_established().unwrap();
+                c.tls_established().unwrap();
+                continue;
+            }
+            if a.is_empty() && b.is_empty() {
+                break;
+            }
+        }
+        sev
+    }
+
+    fn tls_server(pw: Option<&str>, plain: bool, require: bool) -> Server {
+        let verifier = PlainVerifier(std::sync::Arc::new(|u: &str, p: &[u8]| {
+            u == "dev1" && p == b"tok"
+        }));
+        Server::new(
+            ServerConfig {
+                password: pw.map(Password::new),
+                vencrypt: true,
+                require_tls: require,
+                plain: plain.then_some(verifier),
+                challenge: *b"0123456789abcdef",
+                ..Default::default()
+            },
+            100,
+            60,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn vencrypt_x509vnc() {
+        let mut s = tls_server(Some("pw"), false, true);
+        let mut c = Client::new(Config {
+            password: Some(Password::new("pw")),
+            require_tls: true,
+            ..Default::default()
+        });
+        pump_tls(&mut c, &mut s);
+        assert!(s.is_ready());
+        assert!(c.is_connected());
+        assert_eq!(c.tls_subtype(), Some(vencrypt::X509_VNC));
+        assert_eq!(s.tls_subtype(), Some(vencrypt::X509_VNC));
+    }
+
+    #[test]
+    fn vencrypt_x509plain_device() {
+        let mut s = tls_server(None, true, true);
+        let mut c = Client::new(Config {
+            username: Some("dev1".into()),
+            password: Some(Password::new("tok")),
+            require_tls: true,
+            ..Default::default()
+        });
+        let ev = pump_tls(&mut c, &mut s);
+        assert!(s.is_ready() && c.is_connected());
+        assert!(ev.contains(&ServerEvent::PlainLogin {
+            username: "dev1".into(),
+            accepted: true
+        }));
+        // token errado
+        let mut s = tls_server(None, true, true);
+        let mut c = Client::new(Config {
+            username: Some("dev1".into()),
+            password: Some(Password::new("x")),
+            require_tls: true,
+            ..Default::default()
+        });
+        let ev = pump_tls(&mut c, &mut s);
+        assert!(!s.is_ready() && !c.is_connected());
+        assert!(ev.contains(&ServerEvent::AuthFailed));
+    }
+
+    #[test]
+    fn no_silent_downgrade() {
+        // cliente exige TLS, servidor sem VeNCrypt -> erro
+        let (_, mut s) = session(Some("pw"), None);
+        let mut c = Client::new(Config {
+            password: Some(Password::new("pw")),
+            require_tls: true,
+            ..Default::default()
+        });
+        let a = s.take_output();
+        c.feed(&a).unwrap();
+        s.feed(&c.take_output()).unwrap();
+        let e = c.feed(&s.take_output()).unwrap_err();
+        assert!(e.to_string().contains("sem downgrade"), "{e}");
+        assert!(c.take_output().is_empty() || !c.is_connected());
+        // servidor exige TLS: nao anuncia VNC Auth
+        let mut s = tls_server(Some("pw"), false, true);
+        assert_eq!(s.offered(), vec![security_type::VENCRYPT]);
+        // cliente sem TLS contra servidor so-TLS -> erro claro
+        let mut c = Client::new(Config {
+            password: Some(Password::new("pw")),
+            ..Default::default()
+        });
+        c.feed(&s.take_output()).unwrap();
+        s.feed(&c.take_output()).unwrap();
+        let e = c.feed(&s.take_output()).unwrap_err();
+        assert!(e.to_string().contains("ative o TLS"), "{e}");
+        // dados em claro durante TlsPending sao erro
+        let mut s = tls_server(Some("pw"), false, true);
+        let mut c = Client::new(Config {
+            password: Some(Password::new("pw")),
+            require_tls: true,
+            ..Default::default()
+        });
+        for _ in 0..6 {
+            let a = s.take_output();
+            let _ = c.feed(&a);
+            let b = c.take_output();
+            let _ = s.feed(&b);
+        }
+        assert_eq!(s.state, SState::TlsPending);
+        assert!(s.feed(b"x").is_err());
     }
 
     #[test]

@@ -92,6 +92,24 @@ Ordem de execução (cada item com testes por fixtures de bytes):
 3. Pareamento de dispositivos, revogação, logs de auditoria no servidor.
 4. Medir QUIC vs TCP antes de declarar ganho.
 
+**Status v0.3:** concluída, com ressalvas. Verificado no Windows e em container Linux (fmt, clippy `-D warnings`, testes, `cargo deny`):
+
+- VeNCrypt (tipo 19) com X509None/X509Vnc/X509Plain sobre TLS 1.3 (rustls). Cliente: `--tls`, `--pin SHA256`, `--tofu`/`--tofu-accept` (known_hosts), `--ca`. Com TLS pedido, um servidor sem VeNCrypt é recusado (sem downgrade). Certificado trocado gera erro "CERTIFICADO MUDOU".
+- Interop: cliente `openvnc` x Xvnc do TigerVNC com `-SecurityTypes X509Vnc` (TLS 1.3, senha certa/errada, pin errado, sem TLS recusado). Script `ci/tls/run.sh` e job `interop-tls`, que rodou em container local e ainda não no GitHub.
+- Servidor de referência: `--tls`, `--require-tls`, certificado autoassinado gerado no primeiro uso, `fingerprint`; `--pairing` com `pair add/list/revoke` (token de 256 bits, guarda só o SHA-256); log de auditoria JSON lines (conexão, TLS, auth ok/falha com motivo, revogado, desconexão).
+- QUIC (quinn): handshake e 4 streams (controle, entrada, gráficos, metadados) só como transporte, com testes. **Não** está ligado ao servidor nem ao cliente.
+- Medição (`cargo run --release -p openvnc-transport --example bench_transport`), loopback:
+
+| | Windows: vazão | RTT p50 / p99 | Linux (container): vazão | RTT p50 |
+|---|---|---|---|---|
+| TCP | 26–29 Gbit/s | ~30 µs / ~77 µs | 21,8 Gbit/s | 64 µs |
+| TLS 1.3 | 15,5–16,3 Gbit/s | 32–42 µs / ~95 µs | 18,7 Gbit/s | 71 µs |
+| QUIC | 2,3–2,4 Gbit/s | 44–48 µs / 99–128 µs | 3,3 Gbit/s | 132 µs |
+| QUIC: entrada com gráficos saturando | — | ~42 µs / 10–11 ms | — | 172 µs (p99 2,3 ms) |
+
+  Conclusão: **em loopback o QUIC não traz ganho**; custa CPU e vazão. Não foi medido em rede real com perda e latência, onde o benefício esperado (sem head-of-line blocking entre streams) apareceria. Também não há o teste equivalente de "entrada sob carga" em TCP, porque falta o framing próprio, que fica para a Fase 4.
+- Pendências: o cliente desktop compila com TLS, mas ainda não tem UI para pin/TOFU; o listener QUIC fica para quando houver protocolo nativo.
+
 ## Fase 4 — v0.4 Protocolo nativo OpenVNC
 
 1. Especificação em `docs/RFC/` (linguagem normativa, versionada): header `Version(2) Type(2) Flags(2) Length(4)` big-endian; mensagens CLIENT_HELLO…CLOSE; negociação explícita de capabilities; limites de tamanho. Revisão pública antes de congelar códigos.

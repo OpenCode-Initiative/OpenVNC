@@ -13,7 +13,7 @@ use openvnc_framebuffer::Framebuffer;
 pub use openvnc_security::Password;
 
 pub mod server;
-pub use server::{Server, ServerConfig, ServerEvent};
+pub use server::{PlainVerifier, Server, ServerConfig, ServerEvent};
 
 /// Versao do crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -69,13 +69,41 @@ pub mod security_type {
     pub const NONE: u8 = 1;
     /// VNC Authentication (DES, inseguro).
     pub const VNC_AUTH: u8 = 2;
+    /// VeNCrypt (TLS + sub-tipo de autenticacao).
+    pub const VENCRYPT: u8 = 19;
+}
+
+/// Sub-tipos VeNCrypt. So os `X509*` sao suportados: os `TLS*` usam
+/// Diffie-Hellman anonimo (sem autenticacao do servidor, vulneravel a MITM)
+/// e o rustls nao os implementa de proposito.
+pub mod vencrypt {
+    /// Usuario/senha sem TLS (recusado).
+    pub const PLAIN: u32 = 256;
+    /// TLS anonimo, sem auth (recusado).
+    pub const TLS_NONE: u32 = 257;
+    /// TLS anonimo + VNC Auth (recusado).
+    pub const TLS_VNC: u32 = 258;
+    /// TLS anonimo + usuario/senha (recusado).
+    pub const TLS_PLAIN: u32 = 259;
+    /// TLS com certificado, sem auth.
+    pub const X509_NONE: u32 = 260;
+    /// TLS com certificado + VNC Auth.
+    pub const X509_VNC: u32 = 261;
+    /// TLS com certificado + usuario/senha.
+    pub const X509_PLAIN: u32 = 262;
 }
 
 /// Configuracao e limites do cliente.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Senha para VNC Auth.
+    /// Senha para VNC Auth (ou VeNCrypt X509Vnc/X509Plain).
     pub password: Option<Password>,
+    /// Usuario para VeNCrypt X509Plain (com `password`). No servidor de
+    /// referencia e o id do dispositivo pareado.
+    pub username: Option<String>,
+    /// Exigir VeNCrypt (TLS). Se o servidor nao oferecer, a conexao falha:
+    /// **nunca** ha fallback para um tipo sem criptografia.
+    pub require_tls: bool,
     /// Pedir sessao compartilhada no ClientInit.
     pub shared: bool,
     /// Limite do nome do desktop (bytes).
@@ -94,6 +122,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             password: None,
+            username: None,
+            require_tls: false,
             shared: true,
             max_name_len: 4096,
             max_cut_text: 1024 * 1024,
@@ -120,6 +150,10 @@ pub enum Event {
         /// Autenticacao usada.
         security: u8,
     },
+    /// VeNCrypt negociado: o driver deve fazer o handshake TLS sobre o
+    /// socket (depois de enviar `take_output`) e chamar
+    /// [`Client::tls_established`]. Nada pode ser lido antes disso.
+    StartTls,
     /// Um FramebufferUpdate completo foi aplicado.
     UpdateComplete,
     /// Bell.
@@ -171,6 +205,11 @@ enum State {
     SecurityTypes33,
     SecurityTypes,
     FailureReason,
+    VeVersion,
+    VeAck,
+    VeSubtypes,
+    VeSubAck,
+    TlsPending,
     VncChallenge,
     SecurityResult,
     ServerInit,
@@ -203,6 +242,7 @@ pub struct Client {
     events: VecDeque<Event>,
     version: ProtocolVersion,
     security: u8,
+    subtype: Option<u32>,
     pf: PixelFormat,
     fb: Option<Framebuffer>,
     codecs: CodecState,
@@ -229,6 +269,7 @@ impl Client {
             events: VecDeque::new(),
             version: ProtocolVersion::V3_8,
             security: 0,
+            subtype: None,
             pf: PixelFormat::RGBX8888,
             fb: None,
             codecs: CodecState::default(),
@@ -253,6 +294,35 @@ impl Client {
     /// Framebuffer mutavel (ex.: para `take_damage`).
     pub fn framebuffer_mut(&mut self) -> Option<&mut Framebuffer> {
         self.fb.as_mut()
+    }
+
+    /// Sub-tipo VeNCrypt em uso (`None` = sem TLS).
+    pub fn tls_subtype(&self) -> Option<u32> {
+        self.subtype
+    }
+
+    /// Chamado pelo driver quando o handshake TLS terminou. Daqui em diante
+    /// todos os bytes de `feed`/`take_output` passam pelo TLS.
+    pub fn tls_established(&mut self) -> Result<()> {
+        if !matches!(self.state, State::TlsPending) {
+            return Err(Error::Protocol("tls_established fora de hora".into()));
+        }
+        self.state = match self.subtype {
+            Some(vencrypt::X509_VNC) => State::VncChallenge,
+            Some(vencrypt::X509_PLAIN) => {
+                let user = self.cfg.username.clone().unwrap_or_default();
+                let pw = self.cfg.password.clone().unwrap_or_default();
+                self.out
+                    .extend_from_slice(&(user.len() as u32).to_be_bytes());
+                self.out
+                    .extend_from_slice(&(pw.expose().len() as u32).to_be_bytes());
+                self.out.extend_from_slice(user.as_bytes());
+                self.out.extend_from_slice(pw.expose().as_bytes());
+                State::SecurityResult
+            }
+            _ => State::SecurityResult,
+        };
+        self.feed(&[])
     }
 
     /// Handshake concluido?
@@ -323,6 +393,12 @@ impl Client {
                     wait!(State::SecurityTypes33);
                 }
                 let t = be32(b);
+                if self.cfg.require_tls && t != 0 {
+                    return Err(Error::Unsupported(
+                        "servidor RFB 3.3 nao suporta VeNCrypt; TLS exigido, conexao recusada"
+                            .into(),
+                    ));
+                }
                 match t {
                     0 => Ok((State::FailureReason, Some(4))),
                     1 | 2 => {
@@ -346,10 +422,22 @@ impl Client {
                     wait!(State::SecurityTypes);
                 }
                 let types = &b[1..1 + n];
-                let chosen = if types.contains(&security_type::NONE) {
+                let chosen = if self.cfg.require_tls {
+                    if !types.contains(&security_type::VENCRYPT) {
+                        return Err(Error::Unsupported(format!(
+                            "TLS exigido mas o servidor nao oferece VeNCrypt (tipos {types:?}); \
+                             sem downgrade"
+                        )));
+                    }
+                    security_type::VENCRYPT
+                } else if types.contains(&security_type::NONE) {
                     security_type::NONE
                 } else if types.contains(&security_type::VNC_AUTH) {
                     security_type::VNC_AUTH
+                } else if types.contains(&security_type::VENCRYPT) {
+                    return Err(Error::Unsupported(
+                        "servidor so aceita VeNCrypt (TLS); ative o TLS no cliente".into(),
+                    ));
                 } else {
                     return Err(Error::Unsupported(format!(
                         "nenhum tipo de seguranca suportado: {types:?}"
@@ -376,6 +464,78 @@ impl Client {
                 }
                 let reason = String::from_utf8_lossy(&b[4..4 + len]).into_owned();
                 Err(Error::Protocol(format!("servidor recusou: {reason}")))
+            }
+            State::VeVersion => {
+                if !self.need(b, 2) {
+                    wait!(State::VeVersion);
+                }
+                if (b[0], b[1]) < (0, 2) {
+                    return Err(Error::Unsupported(format!(
+                        "VeNCrypt {}.{} (minimo 0.2)",
+                        b[0], b[1]
+                    )));
+                }
+                self.out.extend_from_slice(&[0, 2]);
+                Ok((State::VeAck, Some(2)))
+            }
+            State::VeAck => {
+                if !self.need(b, 1) {
+                    wait!(State::VeAck);
+                }
+                if b[0] != 0 {
+                    return Err(Error::Protocol("servidor recusou VeNCrypt 0.2".into()));
+                }
+                Ok((State::VeSubtypes, Some(1)))
+            }
+            State::VeSubtypes => {
+                if !self.need(b, 1) {
+                    wait!(State::VeSubtypes);
+                }
+                let n = usize::from(b[0]);
+                if !self.need(b, 1 + 4 * n) {
+                    wait!(State::VeSubtypes);
+                }
+                let subs: Vec<u32> = (0..n).map(|i| be32(&b[1 + 4 * i..])).collect();
+                let want: &[u32] = match (&self.cfg.username, &self.cfg.password) {
+                    (Some(_), Some(_)) => &[vencrypt::X509_PLAIN],
+                    (None, Some(_)) => &[vencrypt::X509_VNC, vencrypt::X509_PLAIN],
+                    _ => &[vencrypt::X509_NONE],
+                };
+                let chosen = want.iter().copied().find(|t| subs.contains(t));
+                let Some(chosen) = chosen else {
+                    return Err(Error::Unsupported(format!(
+                        "nenhum sub-tipo VeNCrypt com certificado compativel com as \
+                         credenciais dadas (servidor oferece {subs:?})"
+                    )));
+                };
+                if chosen == vencrypt::X509_PLAIN && self.cfg.username.is_none() {
+                    return Err(Error::Protocol(
+                        "servidor exige usuario e senha (X509Plain)".into(),
+                    ));
+                }
+                self.subtype = Some(chosen);
+                self.out.extend_from_slice(&chosen.to_be_bytes());
+                Ok((State::VeSubAck, Some(1 + 4 * n)))
+            }
+            State::VeSubAck => {
+                if !self.need(b, 1) {
+                    wait!(State::VeSubAck);
+                }
+                if b[0] != 1 {
+                    return Err(Error::Protocol(
+                        "servidor recusou o sub-tipo VeNCrypt".into(),
+                    ));
+                }
+                self.events.push_back(Event::StartTls);
+                Ok((State::TlsPending, Some(1)))
+            }
+            State::TlsPending => {
+                if !b.is_empty() {
+                    return Err(Error::Protocol(
+                        "dados recebidos antes do handshake TLS".into(),
+                    ));
+                }
+                wait!(State::TlsPending);
             }
             State::VncChallenge => {
                 if !self.need(b, 16) {
@@ -585,7 +745,9 @@ impl Client {
     }
 
     fn after_security_chosen(&mut self) -> State {
-        if self.security == security_type::VNC_AUTH {
+        if self.security == security_type::VENCRYPT {
+            State::VeVersion
+        } else if self.security == security_type::VNC_AUTH {
             State::VncChallenge
         } else if self.version == ProtocolVersion::V3_8 {
             State::SecurityResult

@@ -4,6 +4,9 @@
 //! derivada de no maximo 8 caracteres e trafego sem criptografia. Existe
 //! apenas por compatibilidade e a UI deve sinalizar isso ao usuario.
 
+pub mod audit;
+pub mod pairing;
+
 use des::cipher::{BlockEncrypt, KeyInit};
 use des::Des;
 use zeroize::{Zeroize, Zeroizing};

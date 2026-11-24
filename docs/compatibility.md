@@ -59,3 +59,10 @@ Com `OPENVNC_RENDERER=wgpu` (Vulkan) o uso sobe para cerca de 360 MB, quase tudo
 - Raw, CopyRect, Hextile, ZRLE.
 - Tight: fill, basic com filtros copy/palette/gradient. **JPEG não é suportado** e por isso não é anunciado (sem `-32..-23`). O Xvnc foi verificado com Tight.
 - Pseudo-encodings: Cursor (-239), DesktopSize (-223) e ExtendedDesktopSize (-308). O redimensionamento via `xrandr` no Xvnc foi verificado.
+
+## VeNCrypt (v0.3)
+
+| Servidor | Subtipo | Resultado |
+|---|---|---|
+| TigerVNC Xvnc (container) | X509Vnc | ok: TLS 1.3 com pin, senha errada recusada, pin errado recusado, sem TLS recusado, screenshot 320x200 |
+| openvnc-server | X509Plain (pareamento), X509Vnc | ok, incluindo dispositivo revogado recusado |

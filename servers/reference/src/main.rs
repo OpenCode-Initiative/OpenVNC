@@ -9,13 +9,17 @@ mod config;
 mod diff;
 
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use config::{CaptureKind, Config};
 use openvnc_core::{KeyEvent, PointerEvent, Rect};
 use openvnc_framebuffer::{Framebuffer, DEFAULT_MAX_BYTES};
 use openvnc_platform::{InputInjector, NullInjector, ScreenCapture, TestPattern};
-use openvnc_rfb::{Server, ServerConfig, ServerEvent};
+use openvnc_rfb::{PlainVerifier, Server, ServerConfig, ServerEvent};
+use openvnc_security::audit::AuditLog;
+use openvnc_security::pairing::{DeviceStore, Verdict};
 use openvnc_security::Password;
+use openvnc_transport::tls::{ServerIdentity, TlsAcceptor};
+use openvnc_transport::BoxStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -41,6 +45,48 @@ struct Cli {
     /// Aceitar clientes sem senha (so em loopback).
     #[arg(long)]
     allow_no_auth: bool,
+    /// Oferecer VeNCrypt (TLS 1.3).
+    #[arg(long)]
+    tls: bool,
+    /// Oferecer somente VeNCrypt (implica --tls).
+    #[arg(long)]
+    require_tls: bool,
+    /// Autenticar dispositivos pareados (exige TLS).
+    #[arg(long)]
+    pairing: bool,
+    /// Diretorio de estado (certificado, dispositivos, auditoria).
+    #[arg(long)]
+    state_dir: Option<std::path::PathBuf>,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Gerencia dispositivos pareados.
+    Pair {
+        #[command(subcommand)]
+        op: PairOp,
+    },
+    /// Mostra (gerando se preciso) a impressao digital SHA-256 do
+    /// certificado TLS, para conferir/fixar no cliente.
+    Fingerprint,
+}
+
+#[derive(Subcommand, Debug)]
+enum PairOp {
+    /// Pareia um novo dispositivo e mostra o token (uma unica vez).
+    Add {
+        /// Nome do dispositivo.
+        name: String,
+    },
+    /// Lista os dispositivos.
+    List,
+    /// Revoga um dispositivo.
+    Revoke {
+        /// Id (`dev-...`).
+        id: String,
+    },
 }
 
 /// Quadro publicado pela thread de captura.
@@ -62,6 +108,9 @@ struct Shared {
     frames: watch::Receiver<Frame>,
     input: Option<mpsc::Sender<Input>>,
     clients: AtomicUsize,
+    tls: Option<TlsAcceptor>,
+    devices: Option<DeviceStore>,
+    audit: Arc<AuditLog>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -87,6 +136,20 @@ fn main() -> anyhow::Result<()> {
         cfg.max_fps = f;
     }
     cfg.allow_no_auth |= cli.allow_no_auth;
+    cfg.tls |= cli.tls;
+    cfg.require_tls |= cli.require_tls;
+    cfg.pairing |= cli.pairing;
+    if cli.state_dir.is_some() {
+        cfg.state_dir = cli.state_dir.clone();
+    }
+    match &cli.cmd {
+        Some(Cmd::Pair { op }) => return pair_cmd(&cfg, op),
+        Some(Cmd::Fingerprint) => {
+            println!("{}", identity(&cfg)?.fingerprint());
+            return Ok(());
+        }
+        None => {}
+    }
     let password = cfg.resolve_password();
     cfg.validate(&password)?;
 
@@ -96,6 +159,54 @@ fn main() -> anyhow::Result<()> {
         tracing::info!(addr = %listener.local_addr()?, capture = ?cfg.capture, "escutando");
         run(listener, cfg, password).await
     })
+}
+
+fn identity(cfg: &Config) -> anyhow::Result<ServerIdentity> {
+    let (c, k) = cfg.tls_paths();
+    Ok(ServerIdentity::load_or_create(&c, &k, &cfg.tls_names)?)
+}
+
+fn pair_cmd(cfg: &Config, op: &PairOp) -> anyhow::Result<()> {
+    let st = DeviceStore::new(cfg.devices_path());
+    let audit = match cfg.audit_log.clone() {
+        Some(p) => AuditLog::open(&p)?,
+        None => AuditLog::open(&cfg.state_dir().join("audit.log"))?,
+    };
+    match op {
+        PairOp::Add { name } => {
+            let (d, tok) = st.pair(name)?;
+            audit.record("device_paired", &[("device", &d.id), ("name", &d.name)]);
+            println!("dispositivo: {}", d.id);
+            println!("token:       {}", tok.as_str());
+            println!(
+                "impressao digital do servidor: {}",
+                identity(cfg)?.fingerprint()
+            );
+            println!("\nO token nao fica guardado no servidor; entregue-o ao dispositivo agora.");
+            println!(
+                "Cliente: openvnc info <host> ... --tls --pin <impressao> --user {} \
+                 --password-stdin",
+                d.id
+            );
+        }
+        PairOp::List => {
+            for d in st.list()? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    d.id,
+                    if d.revoked { "revogado" } else { "ativo" },
+                    d.created,
+                    d.name
+                );
+            }
+        }
+        PairOp::Revoke { id } => {
+            st.revoke(id)?;
+            audit.record("device_revoked", &[("device", id)]);
+            println!("{id} revogado");
+        }
+    }
+    Ok(())
 }
 
 /// Sobe captura, entrada e aceita conexoes para sempre.
@@ -118,28 +229,68 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         };
         Some(spawn_injector(inj))
     };
+    let tls = if cfg.tls {
+        let id = identity(&cfg)?;
+        tracing::info!(fingerprint = %id.fingerprint(), require = cfg.require_tls, "TLS ativo");
+        Some(id.acceptor()?)
+    } else {
+        None
+    };
+    let devices = cfg.pairing.then(|| DeviceStore::new(cfg.devices_path()));
+    let audit = Arc::new(match cfg.audit_path() {
+        Some(p) => AuditLog::open(&p)?,
+        None => AuditLog::disabled(),
+    });
+    audit.record(
+        "server_start",
+        &[
+            ("listen", &cfg.listen.to_string()),
+            (
+                "tls",
+                if cfg.require_tls {
+                    "required"
+                } else if cfg.tls {
+                    "offered"
+                } else {
+                    "off"
+                },
+            ),
+        ],
+    );
     let shared = Arc::new(Shared {
         cfg,
         password,
         frames,
         input,
         clients: AtomicUsize::new(0),
+        tls,
+        devices,
+        audit,
     });
     loop {
         let (sock, peer) = listener.accept().await?;
         let n = shared.clients.load(Ordering::SeqCst);
         if n >= shared.cfg.max_clients {
             tracing::warn!(%peer, "limite de clientes; recusado");
+            shared.audit.record(
+                "rejected",
+                &[("peer", &peer.to_string()), ("reason", "max_clients")],
+            );
             continue;
         }
         shared.clients.fetch_add(1, Ordering::SeqCst);
         let sh = shared.clone();
         tokio::spawn(async move {
             tracing::info!(%peer, "conectado");
-            if let Err(e) = serve(sock, &sh).await {
+            let p = peer.to_string();
+            sh.audit.record("connect", &[("peer", &p)]);
+            if let Err(e) = serve(sock, &sh, &p).await {
                 tracing::info!(%peer, "desconectado: {e:#}");
+                sh.audit
+                    .record("disconnect", &[("peer", &p), ("error", &format!("{e:#}"))]);
             } else {
                 tracing::info!(%peer, "desconectado");
+                sh.audit.record("disconnect", &[("peer", &p)]);
             }
             sh.clients.fetch_sub(1, Ordering::SeqCst);
         });
@@ -281,8 +432,22 @@ fn plan(old: &Framebuffer, new: &Framebuffer, area: Rect) -> (Vec<(Rect, u16, u1
     (Vec::new(), clip(dirty))
 }
 
-async fn serve(mut sock: TcpStream, sh: &Shared) -> anyhow::Result<()> {
+fn verifier(st: DeviceStore, audit: Arc<AuditLog>, peer: String) -> PlainVerifier {
+    PlainVerifier(Arc::new(move |user: &str, token: &[u8]| {
+        let v = st.verify(user, token);
+        if v != Verdict::Ok {
+            audit.record(
+                "device_auth_failed",
+                &[("peer", &peer), ("device", user), ("reason", v.as_str())],
+            );
+        }
+        v == Verdict::Ok
+    }))
+}
+
+async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
     sock.set_nodelay(true)?;
+    let mut sock: BoxStream = Box::new(sock);
     let mut frames = sh.frames.clone();
     let first = frames.borrow_and_update().clone();
     let mut srv = Server::new(
@@ -291,6 +456,12 @@ async fn serve(mut sock: TcpStream, sh: &Shared) -> anyhow::Result<()> {
             allow_no_auth: sh.cfg.allow_no_auth,
             name: sh.cfg.name.clone(),
             challenge: challenge()?,
+            vencrypt: sh.tls.is_some(),
+            require_tls: sh.cfg.require_tls,
+            plain: sh
+                .devices
+                .clone()
+                .map(|d| verifier(d, sh.audit.clone(), peer.to_string())),
             ..Default::default()
         },
         first.fb.width(),
@@ -308,6 +479,7 @@ async fn serve(mut sock: TcpStream, sh: &Shared) -> anyhow::Result<()> {
         if !out.is_empty() {
             bytes += out.len();
             sock.write_all(&out).await?;
+            sock.flush().await?;
         }
         if since.elapsed() >= Duration::from_secs(5) {
             let secs = since.elapsed().as_secs_f64();
@@ -323,7 +495,35 @@ async fn serve(mut sock: TcpStream, sh: &Shared) -> anyhow::Result<()> {
                 ServerEvent::AuthFailed => {
                     let out = srv.take_output();
                     sock.write_all(&out).await?;
+                    // entrega o motivo e fecha o TLS limpo (close_notify)
+                    let _ = sock.shutdown().await;
+                    sh.audit.record("auth_failed", &[("peer", peer)]);
                     anyhow::bail!("autenticacao falhou");
+                }
+                ServerEvent::StartTls => {
+                    let out = srv.take_output();
+                    sock.write_all(&out).await?;
+                    sock.flush().await?;
+                    let acc = sh.tls.as_ref().expect("vencrypt so com TLS");
+                    let hs = tokio::time::timeout(Duration::from_secs(10), acc.accept(sock));
+                    sock = Box::new(
+                        hs.await
+                            .map_err(|_| anyhow::anyhow!("timeout no handshake TLS"))?
+                            .context("handshake TLS")?,
+                    );
+                    let sub = srv.tls_subtype().unwrap_or(0).to_string();
+                    sh.audit.record("tls", &[("peer", peer), ("subtype", &sub)]);
+                    srv.tls_established()?;
+                    // ex.: desafio do X509Vnc; enviar ja, antes do proximo read
+                    let out = srv.take_output();
+                    sock.write_all(&out).await?;
+                    sock.flush().await?;
+                }
+                ServerEvent::PlainLogin { username, accepted } => {
+                    if accepted {
+                        sh.audit
+                            .record("device_auth", &[("peer", peer), ("device", &username)]);
+                    }
                 }
                 ServerEvent::UpdateRequest { incremental, rect } => {
                     // pedido nao incremental sobrepoe o incremental pendente
@@ -346,6 +546,13 @@ async fn serve(mut sock: TcpStream, sh: &Shared) -> anyhow::Result<()> {
                 }
                 ServerEvent::Initialized { shared, version } => {
                     tracing::debug!(shared, ?version, "cliente pronto");
+                    let enc = if srv.tls_subtype().is_some() {
+                        "tls"
+                    } else {
+                        "none"
+                    };
+                    sh.audit
+                        .record("session", &[("peer", peer), ("encryption", enc)]);
                 }
                 ServerEvent::Encodings(e) => tracing::debug!(?e, "encodings"),
                 ServerEvent::PixelFormatChanged(pf) => tracing::debug!(?pf, "formato"),
@@ -387,7 +594,16 @@ async fn serve(mut sock: TcpStream, sh: &Shared) -> anyhow::Result<()> {
                 if n == 0 {
                     return Ok(());
                 }
-                srv.feed(&buf[..n])?;
+                if let Err(e) = srv.feed(&buf[..n]) {
+                    // entrega o motivo (ex.: SecurityResult de falha) e
+                    // fecha limpo (close_notify no TLS)
+                    let out = srv.take_output();
+                    let _ = sock.write_all(&out).await;
+                    let _ = sock.shutdown().await;
+                    sh.audit
+                        .record("protocol_error", &[("peer", peer), ("error", &e.to_string())]);
+                    return Err(e.into());
+                }
             }
             r = frames.changed(), if view.pending.is_some() => {
                 if r.is_err() {
@@ -520,5 +736,127 @@ mod tests {
             Some(Rect::new(5, 5, 5, 5))
         );
         assert_eq!(intersect(a, Rect::new(10, 0, 5, 5)), None);
+    }
+
+    /// Handshake VeNCrypt completo pelo servidor real; devolve o resultado
+    /// (`Ok` = chegou ao primeiro quadro).
+    async fn tls_session(
+        addr: std::net::SocketAddr,
+        fp: String,
+        cc: CConfig,
+    ) -> Result<(), String> {
+        use openvnc_transport::tls::{ClientTls, Trust};
+        let tls = ClientTls {
+            trust: Trust::Pinned(fp),
+        };
+        let mut sock: BoxStream = Box::new(TcpStream::connect(addr).await.unwrap());
+        let mut c = Client::new(CConfig {
+            require_tls: true,
+            ..cc
+        });
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let out = c.take_output();
+            if !out.is_empty() {
+                sock.write_all(&out).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            let mut start = false;
+            while let Some(e) = c.poll_event() {
+                match e {
+                    Event::StartTls => start = true,
+                    Event::UpdateComplete => return Ok(()),
+                    _ => {}
+                }
+            }
+            if start {
+                sock = Box::new(
+                    tls.connect(sock, "localhost", "t")
+                        .await
+                        .map_err(|e| e.to_string())?,
+                );
+                c.tls_established().map_err(|e| e.to_string())?;
+                continue;
+            }
+            let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+                .await
+                .expect("timeout")
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("servidor fechou".into());
+            }
+            c.feed(&buf[..n]).map_err(|e| e.to_string())?;
+        }
+    }
+
+    fn tls_cfg(dir: &std::path::Path) -> Config {
+        Config {
+            test_pattern_size: (64, 48),
+            require_tls: true,
+            tls: true,
+            state_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_with_pinned_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tls_cfg(dir.path());
+        let fp = identity(&cfg).unwrap().fingerprint();
+        let addr = start(cfg, Some("teste")).await;
+        let cc = || CConfig {
+            password: Some(Password::new("teste")),
+            ..Default::default()
+        };
+        tls_session(addr, fp, cc()).await.unwrap();
+        // impressao digital errada: falha no handshake
+        let other = ServerIdentity::self_signed(&["localhost".into()])
+            .unwrap()
+            .fingerprint();
+        assert!(tls_session(addr, other, cc()).await.is_err());
+        // cliente sem TLS nao consegue nada (sem downgrade)
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let mut c = Client::new(cc());
+        let mut buf = vec![0u8; 4096];
+        let mut failed = false;
+        for _ in 0..4 {
+            let out = c.take_output();
+            s.write_all(&out).await.unwrap();
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            if n == 0 || c.feed(&buf[..n]).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        let log = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        assert!(log.contains("\"tls\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn paired_device_then_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = tls_cfg(dir.path());
+        cfg.pairing = true;
+        let fp = identity(&cfg).unwrap().fingerprint();
+        let st = DeviceStore::new(cfg.devices_path());
+        let (d, tok) = st.pair("notebook").unwrap();
+        let addr = start(cfg, None).await;
+        let cc = |t: &str| CConfig {
+            username: Some(d.id.clone()),
+            password: Some(Password::new(t)),
+            ..Default::default()
+        };
+        tls_session(addr, fp.clone(), cc(tok.as_str()))
+            .await
+            .unwrap();
+        assert!(tls_session(addr, fp.clone(), cc("errado")).await.is_err());
+        st.revoke(&d.id).unwrap();
+        assert!(tls_session(addr, fp, cc(tok.as_str())).await.is_err());
+        let log = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        assert!(log.contains("\"device_auth\""), "{log}");
+        assert!(log.contains("revoked"), "{log}");
+        assert!(log.contains("bad_token"), "{log}");
     }
 }

@@ -14,6 +14,7 @@ use openvnc_client::{Command, ConnectOptions, Session, SessionEvent};
 use openvnc_core::input::keysym;
 use openvnc_core::{KeyEvent, PointerEvent};
 use openvnc_rfb::Password;
+use openvnc_transport::tls::{load_certs, normalize_fingerprint, ClientTls, KnownHosts, Trust};
 
 #[derive(Parser)]
 #[command(name = "openvnc", version, about = "Cliente VNC (RFB 3.3/3.7/3.8)")]
@@ -35,6 +36,25 @@ struct Conn {
     /// Timeout total em segundos
     #[arg(long, default_value_t = 15)]
     timeout: u64,
+    /// Exige VeNCrypt (TLS 1.3); sem downgrade para texto claro
+    #[arg(long)]
+    tls: bool,
+    /// Fixa a impressao digital SHA-256 do certificado (implica --tls)
+    #[arg(long, value_name = "SHA256")]
+    pin: Option<String>,
+    /// Trust on first use: aceita e grava um servidor ainda desconhecido
+    /// em known_hosts (implica --tls; depois exige o mesmo certificado)
+    #[arg(long)]
+    tofu_accept: bool,
+    /// Usa known_hosts sem aceitar hosts novos (implica --tls)
+    #[arg(long)]
+    tofu: bool,
+    /// CA extra em PEM para validar o certificado (implica --tls)
+    #[arg(long, value_name = "PEM")]
+    ca: Option<PathBuf>,
+    /// Usuario / id de dispositivo pareado (VeNCrypt X509Plain)
+    #[arg(long)]
+    user: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -69,6 +89,8 @@ fn options(c: &Conn) -> anyhow::Result<ConnectOptions> {
     let mut o = ConnectOptions::new(addr);
     o.reconnect = false;
     o.config.shared = !c.exclusive;
+    o.tls = tls_options(c)?;
+    o.config.username = c.user.clone();
     o.config.password = if c.password_stdin {
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line)?;
@@ -77,6 +99,35 @@ fn options(c: &Conn) -> anyhow::Result<ConnectOptions> {
         std::env::var("OPENVNC_PASSWORD").ok().map(Password::new)
     };
     Ok(o)
+}
+
+fn tls_options(c: &Conn) -> anyhow::Result<Option<ClientTls>> {
+    let modes = [c.pin.is_some(), c.tofu || c.tofu_accept, c.ca.is_some()];
+    if modes.iter().filter(|m| **m).count() > 1 {
+        bail!("use so um de --pin, --tofu/--tofu-accept, --ca");
+    }
+    let trust = if let Some(fp) = &c.pin {
+        Trust::Pinned(normalize_fingerprint(fp)?)
+    } else if c.tofu || c.tofu_accept {
+        let path = KnownHosts::default_path()
+            .ok_or_else(|| anyhow::anyhow!("sem diretorio para known_hosts"))?;
+        Trust::Tofu {
+            store: KnownHosts::new(path),
+            accept_new: c.tofu_accept,
+        }
+    } else if let Some(ca) = &c.ca {
+        Trust::WebPki {
+            extra_roots: load_certs(&std::fs::read(ca)?)?,
+        }
+    } else if c.tls {
+        Trust::default()
+    } else {
+        if c.user.is_some() {
+            bail!("--user exige TLS (--tls, --pin, --tofu ou --ca)");
+        }
+        return Ok(None);
+    };
+    Ok(Some(ClientTls { trust }))
 }
 
 fn connect(
@@ -89,11 +140,20 @@ fn connect(
         let left = deadline.saturating_duration_since(Instant::now());
         match sess.wait_event(left) {
             Some(e @ SessionEvent::Connected { .. }) => {
-                if let SessionEvent::Connected { legacy_auth, .. } = &e {
-                    eprintln!(
-                        "aviso: conexao SEM criptografia; use um tunel SSH em redes nao confiaveis"
-                    );
-                    if *legacy_auth {
+                if let SessionEvent::Connected {
+                    legacy_auth,
+                    encrypted,
+                    ..
+                } = &e
+                {
+                    if *encrypted {
+                        eprintln!("conexao criptografada (VeNCrypt, TLS 1.3)");
+                    } else {
+                        eprintln!(
+                            "aviso: conexao SEM criptografia; use --tls ou um tunel SSH em redes nao confiaveis"
+                        );
+                    }
+                    if *legacy_auth && !*encrypted {
                         eprintln!("aviso: VNC Auth (DES) e fraca e nao protege a sessao");
                     }
                 }
@@ -122,7 +182,7 @@ fn main() -> anyhow::Result<()> {
                 name,
                 version,
                 legacy_auth,
-                ..
+                encrypted,
             } = e
             {
                 println!("nome:       {name}");
@@ -130,13 +190,22 @@ fn main() -> anyhow::Result<()> {
                 println!("protocolo:  {version:?}");
                 println!(
                     "auth:       {}",
-                    if legacy_auth {
-                        "VNC Auth (DES)"
-                    } else {
-                        "None"
+                    match (legacy_auth, encrypted, conn.user.is_some()) {
+                        (true, true, _) => "VNC Auth dentro do TLS (X509Vnc)",
+                        (true, false, _) => "VNC Auth (DES)",
+                        (false, true, true) => "usuario/dispositivo (X509Plain)",
+                        (false, true, false) => "nenhuma (X509None)",
+                        (false, false, _) => "None",
                     }
                 );
-                println!("criptografia: nao");
+                println!(
+                    "criptografia: {}",
+                    if encrypted {
+                        "TLS 1.3 (VeNCrypt)"
+                    } else {
+                        "nao"
+                    }
+                );
             }
         }
         Cmd::Type { conn, at, text } => {

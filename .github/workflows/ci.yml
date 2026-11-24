@@ -137,6 +137,17 @@ jobs:
       - name: TigerVNC viewer x openvnc-server; openvnc x Xvnc
         run: BIN=target/release/openvnc-server CLI=target/release/openvnc bash ci/interop/run.sh
 
+  interop-tls:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          apt-get update && apt-get install -y --no-install-recommends             tigervnc-standalone-server tigervnc-tools
+      - run: cargo build --release -p openvnc-server -p openvnc-cli
+      - name: VeNCrypt (Xvnc X509Vnc e pareamento no servidor de referencia)
+        run: BIN=target/release/openvnc-server CLI=target/release/openvnc bash ci/tls/run.sh
+
   wayland:
     runs-on: ubuntu-latest
     container: docker.io/library/rust:1

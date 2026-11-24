@@ -19,6 +19,7 @@ openvnc-codecs.workspace = true
 openvnc-rfb.workspace = true
 openvnc-platform.workspace = true
 openvnc-security.workspace = true
+openvnc-transport.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -30,6 +31,9 @@ getrandom = "0.2"
 
 [features]
 wayland = ["openvnc-platform/wayland"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

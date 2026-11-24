@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Fonte de quadros.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
@@ -37,6 +38,28 @@ pub struct Config {
     pub max_clients: usize,
     /// Nome do desktop.
     pub name: String,
+    /// Oferecer VeNCrypt (TLS 1.3).
+    pub tls: bool,
+    /// Oferecer **somente** VeNCrypt (sem tipos em claro). Implica `tls`.
+    pub require_tls: bool,
+    /// Certificado PEM. Padrao: `<state_dir>/server.crt` (gerado
+    /// autoassinado na primeira execucao).
+    pub tls_cert: Option<PathBuf>,
+    /// Chave PEM. Padrao: `<state_dir>/server.key`.
+    pub tls_key: Option<PathBuf>,
+    /// Nomes (SAN) do certificado autoassinado gerado.
+    pub tls_names: Vec<String>,
+    /// Arquivo de dispositivos pareados. Padrao: `<state_dir>/devices`.
+    /// Com `pairing = true`, habilita VeNCrypt X509Plain.
+    pub devices: Option<PathBuf>,
+    /// Autenticar dispositivos pareados.
+    pub pairing: bool,
+    /// Log de auditoria (JSON lines). Padrao: `<state_dir>/audit.log`
+    /// quando `tls` ou `pairing` estao ligados.
+    pub audit_log: Option<PathBuf>,
+    /// Diretorio de estado. Padrao: `OPENVNC_SERVER_DIR`, senao
+    /// `%APPDATA%/openvnc-server` ou `~/.local/share/openvnc-server`.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -52,6 +75,15 @@ impl Default for Config {
             max_fps: 30,
             max_clients: 8,
             name: "OpenVNC".into(),
+            tls: false,
+            require_tls: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_names: vec!["localhost".into()],
+            devices: None,
+            pairing: false,
+            audit_log: None,
+            state_dir: None,
         }
     }
 }
@@ -72,15 +104,70 @@ impl Config {
         })
     }
 
-    /// Valida combinacoes perigosas.
-    pub fn validate(&self, password: &Option<String>) -> anyhow::Result<()> {
-        if password.is_none() && !self.allow_no_auth {
+    /// Diretorio de estado efetivo.
+    pub fn state_dir(&self) -> PathBuf {
+        if let Some(d) = &self.state_dir {
+            return d.clone();
+        }
+        if let Some(d) = std::env::var_os("OPENVNC_SERVER_DIR") {
+            return d.into();
+        }
+        if let Some(d) = std::env::var_os("APPDATA") {
+            return PathBuf::from(d).join("openvnc-server");
+        }
+        if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(d).join("openvnc-server");
+        }
+        match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(".local/share/openvnc-server"),
+            None => PathBuf::from("openvnc-server"),
+        }
+    }
+
+    /// Arquivo de dispositivos efetivo.
+    pub fn devices_path(&self) -> PathBuf {
+        self.devices
+            .clone()
+            .unwrap_or_else(|| self.state_dir().join("devices"))
+    }
+
+    /// Certificado e chave efetivos.
+    pub fn tls_paths(&self) -> (PathBuf, PathBuf) {
+        let d = self.state_dir();
+        (
+            self.tls_cert
+                .clone()
+                .unwrap_or_else(|| d.join("server.crt")),
+            self.tls_key.clone().unwrap_or_else(|| d.join("server.key")),
+        )
+    }
+
+    /// Log de auditoria efetivo (`None` = desligado).
+    pub fn audit_path(&self) -> Option<PathBuf> {
+        self.audit_log
+            .clone()
+            .or_else(|| (self.tls || self.pairing).then(|| self.state_dir().join("audit.log")))
+    }
+
+    /// Valida combinacoes perigosas. Normaliza `require_tls -> tls`.
+    pub fn validate(&mut self, password: &Option<String>) -> anyhow::Result<()> {
+        self.tls |= self.require_tls;
+        if self.pairing && !self.tls {
+            anyhow::bail!("pairing exige tls (o token so trafega dentro do TLS)");
+        }
+        let has_auth = password.is_some() || self.pairing;
+        if !has_auth && !self.allow_no_auth {
             anyhow::bail!(
-                "sem senha: defina OPENVNC_PASSWORD (ou `password`) ou use allow_no_auth = true"
+                "sem senha: defina OPENVNC_PASSWORD (ou `password`), use pairing = true ou allow_no_auth = true"
             );
         }
-        if password.is_none() && !self.listen.ip().is_loopback() {
-            anyhow::bail!("recuso escutar fora do loopback sem senha");
+        if self.allow_no_auth && !self.listen.ip().is_loopback() {
+            anyhow::bail!("recuso escutar fora do loopback com allow_no_auth");
+        }
+        if !self.listen.ip().is_loopback() && !self.require_tls {
+            tracing::warn!(
+                "escutando fora do loopback sem require_tls: senhas VNC Auth sao fracas e o trafego vai em claro"
+            );
         }
         if password.as_ref().is_some_and(|p| p.len() > 8) {
             tracing::warn!("VNC Auth usa so os 8 primeiros caracteres da senha");
@@ -98,11 +185,30 @@ mod tests {
 
     #[test]
     fn defaults_are_safe() {
-        let c = Config::default();
+        let mut c = Config::default();
         assert!(c.listen.ip().is_loopback());
         assert!(!c.allow_no_auth);
         assert!(c.view_only);
         assert_eq!(c.capture, CaptureKind::TestPattern);
+        assert!(c.validate(&None).is_err());
+        assert!(!c.tls && !c.pairing);
+    }
+
+    #[test]
+    fn tls_rules() {
+        let mut c = Config {
+            require_tls: true,
+            pairing: true,
+            listen: "0.0.0.0:5900".parse().unwrap(),
+            ..Default::default()
+        };
+        // so pareamento, fora do loopback, TLS obrigatorio: ok
+        assert!(c.validate(&None).is_ok());
+        assert!(c.tls);
+        let mut c = Config {
+            pairing: true,
+            ..Default::default()
+        };
         assert!(c.validate(&None).is_err());
     }
 
@@ -123,6 +229,8 @@ mod tests {
         assert!(c.validate(&None).is_ok());
         c.listen = "0.0.0.0:5900".parse().unwrap();
         assert!(c.validate(&None).is_err());
+        assert!(c.validate(&Some("x".into())).is_err());
+        c.allow_no_auth = false;
         assert!(c.validate(&Some("x".into())).is_ok());
     }
 }

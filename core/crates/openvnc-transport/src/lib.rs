@@ -1,12 +1,25 @@
-//! Transportes. Fase 1: TCP com timeout e backoff exponencial.
+//! Transportes: TCP com timeout e backoff, TLS 1.3 ([`tls`]) e QUIC
+//! ([`quic`]).
 //!
 //! TCP puro nao tem criptografia: a UI deve avisar o usuario e recomendar
-//! tunel SSH (ver `docs/security.md`).
+//! TLS (VeNCrypt) ou tunel SSH (ver `docs/security.md`).
+
+pub mod quic;
+pub mod tls;
 
 use std::time::Duration;
 
 use openvnc_core::{Error, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+
+/// Qualquer stream bidirecional assincrono (TCP, TLS sobre TCP, ...).
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// Stream com tipo apagado, para trocar TCP por TLS no meio da sessao
+/// (VeNCrypt).
+pub type BoxStream = Box<dyn AsyncStream>;
 
 /// Versao do crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
