@@ -1,0 +1,16 @@
+[package]
+name = "openvnc-security"
+description = "Autenticacao e validacao de certificados."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvnc-core.workspace = true
+des.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

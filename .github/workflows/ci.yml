@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: cargo test --workspace --all-targets
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: Cargo.toml
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build
+      - run: |
+          cargo fuzz run rfb_feed -- -max_total_time=60
+          cargo fuzz run codecs -- -max_total_time=60
+
+  interop-tigervnc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tigervnc-standalone-server
+      - name: Xvnc sem senha
+        run: |
+          Xvnc :1 -geometry 800x600 -SecurityTypes None -localhost=0 &
+          sleep 2
+          cargo run -p openvnc-cli -- screenshot localhost:1 -o none.png
+          cargo run -p openvnc-cli -- info localhost:1
+          test -s none.png
+      - name: Xvnc com VNC Auth
+        run: |
+          printf 'secret12\nsecret12\nn\n' | vncpasswd ~/pw
+          Xvnc :2 -geometry 640x480 -SecurityTypes VncAuth -PasswordFile ~/pw &
+          sleep 2
+          echo secret12 | cargo run -p openvnc-cli -- screenshot localhost:2 -o auth.png --password-stdin
+          test -s auth.png
+
+  interop-tightvnc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tightvncserver xfonts-base
+      - name: Xtightvnc sem senha
+        run: |
+          Xtightvnc :3 -geometry 800x600 -depth 24 &
+          sleep 2
+          cargo run -p openvnc-cli -- info localhost:3
+          cargo run -p openvnc-cli -- screenshot localhost:3 -o tight.png
+          test -s tight.png
+      - name: Xtightvnc com VNC Auth
+        run: |
+          mkdir -p ~/.vnc
+          printf 'secret12\nsecret12\nn\n' | USER=runner vncpasswd ~/.vnc/tpw
+          Xtightvnc :4 -geometry 640x480 -depth 24 -rfbauth ~/.vnc/tpw &
+          sleep 2
+          echo secret12 | cargo run -p openvnc-cli -- screenshot localhost:4 -o tauth.png --password-stdin
+          test -s tauth.png
+          if echo errada | cargo run -p openvnc-cli -- info localhost:4 --password-stdin; then
+            echo "senha errada foi aceita"; exit 1
+          fi

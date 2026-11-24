@@ -1,0 +1,18 @@
+[package]
+name = "openvnc-rfb"
+description = "Protocolo RFB 3.3/3.7/3.8 (RFC 6143), maquina de estados sans-IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvnc-core.workspace = true
+openvnc-framebuffer.workspace = true
+openvnc-codecs.workspace = true
+openvnc-security.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["core/crates/*", "clients/*"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/OpenCode-Initiative/OpenVNC"
+rust-version = "1.85"
+
+[workspace.dependencies]
+thiserror = "2"
+tracing = "0.1"
+openvnc-core = { path = "core/crates/openvnc-core" }
+openvnc-framebuffer = { path = "core/crates/openvnc-framebuffer" }
+openvnc-codecs = { path = "core/crates/openvnc-codecs" }
+openvnc-rfb = { path = "core/crates/openvnc-rfb" }
+openvnc-security = { path = "core/crates/openvnc-security" }
+openvnc-transport = { path = "core/crates/openvnc-transport" }
+openvnc-client = { path = "core/crates/openvnc-client" }
+flate2 = "1"
+des = "0.8"
+zeroize = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+clap = { version = "4", features = ["derive"] }
+png = "0.17"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

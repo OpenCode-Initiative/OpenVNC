@@ -1,0 +1,16 @@
+[package]
+name = "openvnc-codecs"
+description = "Encodings RFB: Raw, CopyRect, Hextile, ZRLE, Tight."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvnc-core.workspace = true
+openvnc-framebuffer.workspace = true
+flate2.workspace = true
+
+[lints]
+workspace = true
