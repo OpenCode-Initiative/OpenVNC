@@ -1,0 +1,635 @@
+//! Protocolo nativo OpenVNC (RFC 0001) sobre QUIC, com fallback TCP+TLS
+//! na mesma porta.
+//!
+//! No QUIC cada canal logico e um stream proprio (controle, entrada,
+//! graficos); no TCP+TLS todas as mensagens compartilham o stream. Os dois
+//! transportes alimentam a mesma sessao: leitores empurram mensagens numa
+//! fila de entrada e escritores drenam as filas de saida.
+
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use anyhow::{bail, Context as _};
+use openvnc_core::{KeyEvent, PointerEvent, Rect};
+use openvnc_framebuffer::Framebuffer;
+use openvnc_protocol::io::{read_message, write_message};
+use openvnc_protocol::{
+    auth_method, capability, close_code, encoding, FrameRect, Input as NInput, Message,
+    DEFAULT_MAX_PAYLOAD, MAX_RECTS, PROTOCOL_VERSION,
+};
+use openvnc_security::pairing::Verdict;
+use openvnc_transport::quic;
+use openvnc_transport::tls::TlsAcceptor;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+use crate::{diff, Frame, Input, Shared};
+
+/// Quadros enviados sem confirmacao (controle de fluxo).
+const WINDOW: u64 = 2;
+/// Lado dos tiles do quadro completo.
+const TILE: u16 = 64;
+/// Tempo maximo para hello + autenticacao.
+/// Sem mudancas por este tempo apos video, a tela e reenviada sem perdas.
+const REFINE_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
+/// Percentual da tela que precisa mudar para usar video.
+#[cfg(feature = "h264")]
+const VIDEO_THRESHOLD_PCT: u64 = 25;
+/// Taxa alvo do H.264 em bit/s.
+#[cfg(feature = "h264")]
+const VIDEO_BITRATE: u32 = 8_000_000;
+
+/// Estado de video H.264 de uma sessao.
+struct Video {
+    #[cfg_attr(not(feature = "h264"), allow(dead_code))]
+    enabled: bool,
+    /// O cliente tem uma imagem com perdas ainda nao refinada.
+    lossy: bool,
+    #[cfg(feature = "h264")]
+    enc: Option<openvnc_codecs::video::H264Encoder>,
+}
+
+impl Video {
+    fn new(enabled: bool) -> Self {
+        Video {
+            enabled: enabled && cfg!(feature = "h264"),
+            lossy: false,
+            #[cfg(feature = "h264")]
+            enc: None,
+        }
+    }
+
+    /// Decide se a mudanca vai como video. Retorna o retangulo H.264 de tela
+    /// inteira, ou `None` para seguir com tiles sem perdas.
+    #[cfg(feature = "h264")]
+    fn frame(
+        &mut self,
+        fb: &Framebuffer,
+        rects: &[Rect],
+        resized: bool,
+    ) -> anyhow::Result<Option<FrameRect>> {
+        use openvnc_codecs::video::{supported, H264Encoder};
+        if resized {
+            self.enc = None;
+        }
+        if !self.enabled || resized || rects.is_empty() {
+            return Ok(None);
+        }
+        let (w, h) = (fb.width(), fb.height());
+        let dirty: u64 = rects
+            .iter()
+            .map(|r| u64::from(r.width) * u64::from(r.height))
+            .sum();
+        let total = u64::from(w) * u64::from(h);
+        if !supported(w, h) || dirty * 100 < total * VIDEO_THRESHOLD_PCT {
+            return Ok(None);
+        }
+        let enc = match &mut self.enc {
+            Some(e) if e.size() == (w, h) => e,
+            slot => slot.insert(H264Encoder::new(w, h, VIDEO_BITRATE)?),
+        };
+        let (data, _key) = enc.encode(&extract(fb, Rect::new(0, 0, w, h)))?;
+        self.lossy = true;
+        Ok(Some(FrameRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            encoding: encoding::H264,
+            data,
+        }))
+    }
+
+    #[cfg(not(feature = "h264"))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn frame(&mut self, _: &Framebuffer, _: &[Rect], _: bool) -> anyhow::Result<Option<FrameRect>> {
+        Ok(None)
+    }
+}
+
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Listeners nativos ja ligados.
+pub struct Listeners {
+    endpoint: quinn::Endpoint,
+    tcp: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl Listeners {
+    /// Endereco efetivo (UDP e TCP usam a mesma porta).
+    pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
+        Ok(self.endpoint.local_addr()?)
+    }
+}
+
+/// Liga QUIC (UDP) em `addr` e TCP+TLS na mesma porta.
+pub async fn bind(addr: SocketAddr, cfg: &crate::Config) -> anyhow::Result<Listeners> {
+    let id = crate::identity(cfg)?;
+    let endpoint = quic::server_endpoint(addr, &id).context("ligando QUIC")?;
+    let real = endpoint.local_addr()?;
+    let tcp = TcpListener::bind(real)
+        .await
+        .with_context(|| format!("ligando TCP+TLS nativo em {real}"))?;
+    tracing::info!(addr = %real, fingerprint = %id.fingerprint(), "protocolo nativo (QUIC + TCP/TLS)");
+    Ok(Listeners {
+        endpoint,
+        tcp,
+        acceptor: id.acceptor()?,
+    })
+}
+
+/// Aceita conexoes nos dois transportes ate o endpoint fechar.
+pub async fn serve(l: Listeners, sh: Arc<Shared>) {
+    let Listeners {
+        endpoint,
+        tcp,
+        acceptor,
+    } = l;
+    let sh2 = sh.clone();
+    let tcp_task = tokio::spawn(async move {
+        loop {
+            let Ok((sock, peer)) = tcp.accept().await else {
+                continue;
+            };
+            let _ = sock.set_nodelay(true);
+            let acc = acceptor.clone();
+            let sh = sh2.clone();
+            tokio::spawn(async move {
+                let Some(_slot) = Slot::take(&sh, &peer.to_string()) else {
+                    return;
+                };
+                let tls = match acc.accept(sock).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::info!(%peer, "TLS nativo falhou: {e}");
+                        return;
+                    }
+                };
+                let (r, w) = tokio::io::split(tls);
+                let (in_tx, in_rx) = mpsc::channel(256);
+                let (out_tx, out_rx) = mpsc::channel(64);
+                tokio::spawn(reader(r, in_tx));
+                let wt = tokio::spawn(writer(w, out_rx));
+                run_session(
+                    &sh,
+                    &peer.to_string(),
+                    "tcp-tls",
+                    in_rx,
+                    out_tx.clone(),
+                    out_tx,
+                )
+                .await;
+                let _ = wt.await;
+            });
+        }
+    });
+    loop {
+        let s = match quic::accept(&endpoint).await {
+            Ok(Some(s)) => s,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::info!("QUIC: conexao recusada: {e}");
+                continue;
+            }
+        };
+        let sh = sh.clone();
+        tokio::spawn(async move {
+            let peer = s.connection.remote_address().to_string();
+            let Some(_slot) = Slot::take(&sh, &peer) else {
+                s.connection.close(4u32.into(), b"limite de clientes");
+                return;
+            };
+            let (in_tx, in_rx) = mpsc::channel(256);
+            let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
+            let (gfx_tx, gfx_rx) = mpsc::channel(8);
+            tokio::spawn(reader(s.control.recv, in_tx.clone()));
+            tokio::spawn(reader(s.input.recv, in_tx.clone()));
+            tokio::spawn(reader(s.graphics.recv, in_tx));
+            let wc = tokio::spawn(writer(s.control.send, ctrl_rx));
+            let wg = tokio::spawn(writer(s.graphics.send, gfx_rx));
+            run_session(&sh, &peer, "quic", in_rx, ctrl_tx, gfx_tx).await;
+            let _ = wc.await;
+            let _ = wg.await;
+            s.connection.close(0u32.into(), b"fim");
+        });
+    }
+    tcp_task.abort();
+}
+
+/// Reserva uma vaga no limite de clientes; libera no drop.
+struct Slot<'a>(&'a Shared);
+
+impl<'a> Slot<'a> {
+    fn take(sh: &'a Shared, peer: &str) -> Option<Self> {
+        if sh.clients.fetch_add(1, Ordering::SeqCst) >= sh.cfg.max_clients {
+            sh.clients.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(%peer, "limite de clientes; recusado (nativo)");
+            sh.audit
+                .record("rejected", &[("peer", peer), ("reason", "max_clients")]);
+            return None;
+        }
+        Some(Slot(sh))
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.clients.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn reader<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<Message>) {
+    while let Ok(m) = read_message(&mut r, DEFAULT_MAX_PAYLOAD).await {
+        if tx.send(m).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn writer<W: AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::Receiver<Message>) {
+    while let Some(m) = rx.recv().await {
+        if write_message(&mut w, &m, DEFAULT_MAX_PAYLOAD)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+}
+
+async fn run_session(
+    sh: &Shared,
+    peer: &str,
+    transport: &str,
+    inbox: mpsc::Receiver<Message>,
+    ctrl: mpsc::Sender<Message>,
+    gfx: mpsc::Sender<Message>,
+) {
+    tracing::info!(%peer, transport, "nativo: conectado");
+    sh.audit
+        .record("connect", &[("peer", peer), ("transport", transport)]);
+    match session(sh, peer, inbox, &ctrl, &gfx).await {
+        Ok(()) => {
+            tracing::info!(%peer, "nativo: desconectado");
+            sh.audit.record("disconnect", &[("peer", peer)]);
+        }
+        Err(e) => {
+            tracing::info!(%peer, "nativo: desconectado: {e:#}");
+            sh.audit.record(
+                "disconnect",
+                &[("peer", peer), ("error", &format!("{e:#}"))],
+            );
+        }
+    }
+}
+
+/// Metodos de autenticacao oferecidos pela configuracao.
+fn methods(sh: &Shared) -> Vec<u8> {
+    let mut m = Vec::new();
+    if sh.password.is_some() {
+        m.push(auth_method::PASSWORD);
+    }
+    if sh.devices.is_some() {
+        m.push(auth_method::DEVICE);
+    }
+    if sh.cfg.allow_no_auth {
+        m.push(auth_method::NONE);
+    }
+    m
+}
+
+/// Comparacao em tempo constante para o tamanho dado.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Confere as credenciais. `Err` traz o motivo (sem o segredo).
+fn check_auth(
+    sh: &Shared,
+    peer: &str,
+    method: u8,
+    user: &str,
+    secret: &[u8],
+) -> Result<(), String> {
+    if !methods(sh).contains(&method) {
+        return Err("metodo nao permitido".into());
+    }
+    match method {
+        auth_method::NONE => Ok(()),
+        auth_method::PASSWORD => {
+            let pw = sh.password.as_deref().unwrap_or_default();
+            if ct_eq(pw.as_bytes(), secret) {
+                Ok(())
+            } else {
+                Err("senha incorreta".into())
+            }
+        }
+        auth_method::DEVICE => {
+            let Some(st) = &sh.devices else {
+                return Err("pareamento desligado".into());
+            };
+            match st.verify(user, secret) {
+                Verdict::Ok => Ok(()),
+                v => {
+                    sh.audit.record(
+                        "device_auth_failed",
+                        &[("peer", peer), ("device", user), ("reason", v.as_str())],
+                    );
+                    Err(format!("dispositivo recusado: {}", v.as_str()))
+                }
+            }
+        }
+        _ => Err("metodo desconhecido".into()),
+    }
+}
+
+async fn close(ctrl: &mpsc::Sender<Message>, code: u16, reason: &str) {
+    let _ = ctrl
+        .send(Message::Close {
+            code,
+            reason: reason.into(),
+        })
+        .await;
+}
+
+/// Hello + autenticacao. Devolve se o cliente aceita ZLIB.
+async fn handshake(
+    sh: &Shared,
+    peer: &str,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctrl: &mpsc::Sender<Message>,
+) -> anyhow::Result<Vec<u32>> {
+    let Some(Message::ClientHello {
+        min_version,
+        max_version,
+        capabilities,
+        name,
+    }) = inbox.recv().await
+    else {
+        close(ctrl, close_code::PROTOCOL_ERROR, "esperava CLIENT_HELLO").await;
+        bail!("esperava CLIENT_HELLO");
+    };
+    if !(min_version..=max_version).contains(&PROTOCOL_VERSION) {
+        close(
+            ctrl,
+            close_code::UNSUPPORTED_VERSION,
+            "versao nao suportada",
+        )
+        .await;
+        bail!("versao {min_version}..={max_version} nao suportada");
+    }
+    let ours: &[u32] = if cfg!(feature = "h264") {
+        &[
+            capability::TILE_RAW,
+            capability::TILE_ZLIB,
+            capability::VIDEO_H264,
+        ]
+    } else {
+        &[capability::TILE_RAW, capability::TILE_ZLIB]
+    };
+    let caps: Vec<u32> = capabilities
+        .iter()
+        .copied()
+        .filter(|c| ours.contains(c))
+        .collect();
+    tracing::debug!(%peer, client = %name, ?caps, "CLIENT_HELLO");
+    ctrl.send(Message::ServerHello {
+        version: PROTOCOL_VERSION,
+        capabilities: caps.clone(),
+        auth_methods: methods(sh),
+        name: sh.cfg.name.clone(),
+    })
+    .await?;
+    let Some(Message::AuthRequest {
+        method,
+        user,
+        secret,
+    }) = inbox.recv().await
+    else {
+        close(ctrl, close_code::PROTOCOL_ERROR, "esperava AUTH_REQUEST").await;
+        bail!("esperava AUTH_REQUEST");
+    };
+    if let Err(reason) = check_auth(sh, peer, method, &user, &secret) {
+        sh.audit
+            .record("auth_failed", &[("peer", peer), ("reason", &reason)]);
+        ctrl.send(Message::AuthResult {
+            ok: false,
+            reason: reason.clone(),
+        })
+        .await?;
+        close(ctrl, close_code::AUTH_FAILED, &reason).await;
+        bail!("autenticacao: {reason}");
+    }
+    sh.audit
+        .record("auth_ok", &[("peer", peer), ("user", &user)]);
+    ctrl.send(Message::AuthResult {
+        ok: true,
+        reason: String::new(),
+    })
+    .await?;
+    Ok(caps)
+}
+
+async fn session(
+    sh: &Shared,
+    peer: &str,
+    mut inbox: mpsc::Receiver<Message>,
+    ctrl: &mpsc::Sender<Message>,
+    gfx: &mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let caps = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(sh, peer, &mut inbox, ctrl))
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout no handshake"))??;
+    let zlib = caps.contains(&capability::TILE_ZLIB);
+    let mut video = Video::new(caps.contains(&capability::VIDEO_H264));
+    let mut frames = sh.frames.clone();
+    let mut sent: Option<Frame> = None;
+    let (mut seq, mut acked) = (0u64, 0u64);
+    loop {
+        if seq - acked < WINDOW {
+            let cur = frames.borrow_and_update().clone();
+            if sent.as_ref().map(|s| s.gen) != Some(cur.gen) {
+                let size = (cur.fb.width(), cur.fb.height());
+                let resized = sent
+                    .as_ref()
+                    .is_none_or(|s| (s.fb.width(), s.fb.height()) != size);
+                if resized {
+                    ctrl.send(Message::DisplayInfo {
+                        width: size.0,
+                        height: size.1,
+                        name: sh.cfg.name.clone(),
+                    })
+                    .await?;
+                }
+                let rects = match (&sent, resized) {
+                    (Some(old), false) => diff::dirty_tiles(&old.fb, &cur.fb),
+                    _ => grid(size.0, size.1),
+                };
+                if let Some(r) = video.frame(&cur.fb, &rects, resized)? {
+                    seq += 1;
+                    gfx.send(Message::FrameUpdate {
+                        seq,
+                        rects: vec![r],
+                    })
+                    .await?;
+                } else if !rects.is_empty() {
+                    for chunk in rects.chunks(MAX_RECTS) {
+                        seq += 1;
+                        let rects = chunk
+                            .iter()
+                            .map(|r| encode_rect(&cur.fb, *r, zlib))
+                            .collect::<anyhow::Result<_>>()?;
+                        gfx.send(Message::FrameUpdate { seq, rects }).await?;
+                    }
+                }
+                sent = Some(cur);
+            }
+        }
+        tokio::select! {
+            m = inbox.recv() => match m {
+                None => return Ok(()),
+                Some(Message::FrameAck { seq: s }) => {
+                    if s > seq {
+                        bail!("FRAME_ACK de quadro nao enviado");
+                    }
+                    acked = acked.max(s);
+                }
+                Some(Message::InputEvent(ev)) => forward(sh, ev),
+                Some(Message::Ping { nonce }) => ctrl.send(Message::Pong { nonce }).await?,
+                Some(Message::Pong { .. }) => {}
+                Some(Message::Close { .. }) => return Ok(()),
+                Some(other) => {
+                    close(ctrl, close_code::PROTOCOL_ERROR, "mensagem inesperada").await;
+                    bail!("mensagem inesperada: tipo {:#06x}", other.type_code());
+                }
+            },
+            _ = tokio::time::sleep(REFINE_AFTER), if video.lossy && seq - acked < WINDOW => {
+                // movimento parou: reenvia a tela sem perdas
+                video.lossy = false;
+                if let Some(s) = &sent {
+                    for chunk in grid(s.fb.width(), s.fb.height()).chunks(MAX_RECTS) {
+                        seq += 1;
+                        let rects = chunk
+                            .iter()
+                            .map(|r| encode_rect(&s.fb, *r, zlib))
+                            .collect::<anyhow::Result<_>>()?;
+                        gfx.send(Message::FrameUpdate { seq, rects }).await?;
+                    }
+                }
+            }
+            r = frames.changed(), if seq - acked < WINDOW => {
+                if r.is_err() {
+                    close(ctrl, close_code::SERVER_SHUTDOWN, "captura encerrada").await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn forward(sh: &Shared, ev: NInput) {
+    let Some(tx) = &sh.input else { return };
+    let ev = match ev {
+        NInput::Pointer { x, y, buttons } => Input::Pointer(PointerEvent { buttons, x, y }),
+        NInput::Key { keysym, down } => Input::Key(KeyEvent { down, keysym }),
+    };
+    let _ = tx.send(ev);
+}
+
+/// Tiles cobrindo a tela inteira.
+fn grid(w: u16, h: u16) -> Vec<Rect> {
+    let mut v = Vec::new();
+    let mut y = 0u16;
+    while y < h {
+        let th = TILE.min(h - y);
+        let mut x = 0u16;
+        while x < w {
+            let tw = TILE.min(w - x);
+            v.push(Rect::new(x, y, tw, th));
+            x += tw;
+        }
+        y += th;
+    }
+    v
+}
+
+/// Extrai o retangulo como RGBA8 e codifica.
+fn extract(fb: &Framebuffer, r: Rect) -> Vec<u8> {
+    let stride = fb.stride();
+    let mut raw = Vec::with_capacity(usize::from(r.width) * usize::from(r.height) * 4);
+    for row in r.y..r.y + r.height {
+        let off = usize::from(row) * stride + usize::from(r.x) * 4;
+        raw.extend_from_slice(&fb.data()[off..off + usize::from(r.width) * 4]);
+    }
+    raw
+}
+
+fn encode_rect(fb: &Framebuffer, r: Rect, zlib: bool) -> anyhow::Result<FrameRect> {
+    let raw = extract(fb, r);
+    let (enc, data) = if zlib {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        z.write_all(&raw)?;
+        (encoding::ZLIB, z.finish()?)
+    } else {
+        (encoding::RAW, raw)
+    };
+    Ok(FrameRect {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+        encoding: enc,
+        data,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "h264")]
+    #[test]
+    fn video_so_com_mudanca_grande() {
+        use openvnc_codecs::video::H264Decoder;
+        let mut fb = Framebuffer::new(64, 48, 1 << 20).unwrap();
+        let mut v = super::Video::new(true);
+        let small = [Rect::new(0, 0, 8, 8)];
+        assert!(v.frame(&fb, &small, false).unwrap().is_none());
+        assert!(v.frame(&fb, &super::grid(64, 48), true).unwrap().is_none());
+        for y in 0..48 {
+            fb.put_rgba_row(0, y, &[[200, 10, 10, 255]; 64]);
+        }
+        let r = v.frame(&fb, &super::grid(64, 48), false).unwrap().unwrap();
+        assert_eq!((r.encoding, r.width, r.height), (encoding::H264, 64, 48));
+        assert!(v.lossy);
+        let mut out = vec![0u8; 64 * 48 * 4];
+        assert!(H264Decoder::new()
+            .unwrap()
+            .decode(&r.data, 64, 48, &mut out)
+            .unwrap());
+        assert!(out[0].abs_diff(200) < 12 && out[1] < 24);
+    }
+
+    use super::*;
+
+    #[test]
+    fn grid_cobre_a_tela() {
+        let g = grid(130, 70);
+        assert_eq!(g.len(), 3 * 2);
+        let area: u32 = g
+            .iter()
+            .map(|r| u32::from(r.width) * u32::from(r.height))
+            .sum();
+        assert_eq!(area, 130 * 70);
+    }
+
+    #[test]
+    fn comparacao_constante() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+    }
+}

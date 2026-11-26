@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["core/crates/*", "clients/*", "servers/*"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/OpenCode-Initiative/OpenVNC"
+rust-version = "1.85"
+
+[workspace.dependencies]
+thiserror = "2"
+tracing = "0.1"
+openvnc-core = { path = "core/crates/openvnc-core", version = "0.0.1" }
+openvnc-framebuffer = { path = "core/crates/openvnc-framebuffer", version = "0.0.1" }
+openvnc-codecs = { path = "core/crates/openvnc-codecs", version = "0.0.1" }
+openvnc-rfb = { path = "core/crates/openvnc-rfb", version = "0.0.1" }
+openvnc-security = { path = "core/crates/openvnc-security", version = "0.0.1" }
+openvnc-transport = { path = "core/crates/openvnc-transport", version = "0.0.1" }
+openvnc-platform = { path = "core/crates/openvnc-platform", version = "0.0.1" }
+openvnc-client = { path = "core/crates/openvnc-client", version = "0.0.1" }
+openvnc-protocol = { path = "core/crates/openvnc-protocol", version = "0.0.1" }
+flate2 = "1"
+des = "0.8"
+zeroize = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+clap = { version = "4", features = ["derive"] }
+png = "0.17"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { version = "0.5", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "0.26"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+sha2 = "0.10"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
+rand = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

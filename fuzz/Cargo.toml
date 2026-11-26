@@ -1,0 +1,30 @@
+[package]
+name = "openvnc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+openvnc-rfb = { path = "../core/crates/openvnc-rfb" }
+openvnc-codecs = { path = "../core/crates/openvnc-codecs" }
+openvnc-framebuffer = { path = "../core/crates/openvnc-framebuffer" }
+openvnc-core = { path = "../core/crates/openvnc-core" }
+
+# fora do workspace principal (requer nightly)
+[workspace]
+
+[[bin]]
+name = "rfb_feed"
+path = "fuzz_targets/rfb_feed.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "codecs"
+path = "fuzz_targets/codecs.rs"
+test = false
+doc = false

@@ -1,0 +1,8 @@
+# Wayland: sway headless + xdg-desktop-portal-wlr + PipeWire, para testar
+# a captura pelo portal (feature `wayland`) com o vncviewer em Xvfb.
+FROM docker.io/library/rust:1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libpipewire-0.3-dev clang libclang-dev pkg-config \
+      sway xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber dbus dbus-x11 dbus-user-session \
+      xvfb tigervnc-viewer tigervnc-tools imagemagick x11-apps procps foot gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-base pipewire-bin \
+    && rm -rf /var/lib/apt/lists/*

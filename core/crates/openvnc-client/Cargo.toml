@@ -1,0 +1,28 @@
+[package]
+name = "openvnc-client"
+description = "Sessao de cliente assincrona: roda openvnc-rfb sobre TCP com reconexao."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvnc-core.workspace = true
+openvnc-framebuffer.workspace = true
+openvnc-protocol.workspace = true
+openvnc-rfb.workspace = true
+flate2.workspace = true
+quinn.workspace = true
+openvnc-transport.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+openvnc-codecs = { workspace = true, optional = true }
+
+[features]
+default = ["h264"]
+# Decodificacao de video H.264 no protocolo nativo (compila o openh264 da Cisco)
+h264 = ["dep:openvnc-codecs", "openvnc-codecs/h264"]
+
+[lints]
+workspace = true

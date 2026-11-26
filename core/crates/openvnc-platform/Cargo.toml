@@ -1,0 +1,46 @@
+[package]
+name = "openvnc-platform"
+description = "Captura de tela e injecao de entrada por SO (traits ScreenCapture/InputInjector)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvnc-core.workspace = true
+openvnc-framebuffer.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = { version = "0.13", features = ["xtest", "damage", "shm"] }
+# mapeia o segmento MIT-SHM criado pelo servidor X (ShmCreateSegment)
+memmap2 = "0.9"
+ashpd = { version = "0.10", optional = true, default-features = false, features = ["tokio"] }
+pipewire = { version = "0.8", optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+# Captura/entrada Wayland pelo xdg-desktop-portal + PipeWire.
+# Exige libpipewire-0.3-dev e clang no build.
+wayland = ["dep:ashpd", "dep:pipewire", "dep:tokio"]
+
+[lints]
+workspace = true
