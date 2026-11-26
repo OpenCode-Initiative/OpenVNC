@@ -258,7 +258,9 @@ fn main() -> anyhow::Result<()> {
                 t => bail!("transporte invalido: {t} (auto, quic, tcp)"),
             };
             let o = options(&conn)?;
-            let tls = o.tls.context("o protocolo nativo exige --tls, --pin, --tofu ou --ca")?;
+            let tls = o
+                .tls
+                .context("o protocolo nativo exige --tls, --pin, --tofu ou --ca")?;
             let secret = o.config.password.as_ref().map(|p| p.expose().to_string());
             let auth = match (conn.user.clone(), secret) {
                 (Some(id), Some(token)) => NativeAuth::Device { id, token },
@@ -282,16 +284,27 @@ fn main() -> anyhow::Result<()> {
                     c.framebuffer().height()
                 );
                 loop {
-                    let ev = tokio::time::timeout(Duration::from_secs(conn.timeout), c.next_event())
-                        .await
-                        .context("timeout esperando o primeiro quadro")??;
+                    let ev =
+                        tokio::time::timeout(Duration::from_secs(conn.timeout), c.next_event())
+                            .await
+                            .context("timeout esperando o primeiro quadro")??;
                     if matches!(ev, NativeEvent::Frame(_)) {
                         break;
                     }
                 }
                 let fb = c.framebuffer();
-                write_png(&output, u32::from(fb.width()), u32::from(fb.height()), fb.data())?;
-                println!("{}x{} salvo em {}", fb.width(), fb.height(), output.display());
+                write_png(
+                    &output,
+                    u32::from(fb.width()),
+                    u32::from(fb.height()),
+                    fb.data(),
+                )?;
+                println!(
+                    "{}x{} salvo em {}",
+                    fb.width(),
+                    fb.height(),
+                    output.display()
+                );
                 c.close().await;
                 anyhow::Ok(())
             })?;

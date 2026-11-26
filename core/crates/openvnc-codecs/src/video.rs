@@ -41,10 +41,10 @@ impl H264Encoder {
             return Err(verr("dimensoes precisam ser pares e >= 16"));
         }
         let cfg = EncoderConfig::new()
-            .set_bitrate_bps(bitrate)
-            .max_frame_rate(60.0)
+            .bitrate(openh264::encoder::BitRate::from_bps(bitrate))
+            .max_frame_rate(openh264::encoder::FrameRate::from_hz(60.0))
             .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
-            .enable_skip_frame(false);
+            .skip_frames(false);
         let inner = Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(verr)?;
         Ok(H264Encoder {
             inner,

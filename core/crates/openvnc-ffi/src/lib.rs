@@ -152,7 +152,8 @@ pub unsafe extern "C" fn openvnc_msg_pointer(
     buttons: *mut u8,
 ) -> i32 {
     guard(|| {
-        let (Some(d), Some(x), Some(y), Some(b)) = (d.as_ref(), x.as_mut(), y.as_mut(), buttons.as_mut())
+        let (Some(d), Some(x), Some(y), Some(b)) =
+            (d.as_ref(), x.as_mut(), y.as_mut(), buttons.as_mut())
         else {
             return OPENVNC_EINVAL;
         };
@@ -185,7 +186,10 @@ pub unsafe extern "C" fn openvnc_msg_key(
             return OPENVNC_EINVAL;
         };
         match d.last {
-            Some(Message::InputEvent(Input::Key { keysym: ks, down: kd })) => {
+            Some(Message::InputEvent(Input::Key {
+                keysym: ks,
+                down: kd,
+            })) => {
                 *k = ks;
                 *dn = u8::from(kd);
                 OPENVNC_OK
@@ -281,7 +285,12 @@ pub unsafe extern "C" fn openvnc_encode_clipboard(
         let Ok(s) = std::str::from_utf8(bytes) else {
             return OPENVNC_EINVAL;
         };
-        encode_into(&Message::Clipboard { text: s.to_string() }, out)
+        encode_into(
+            &Message::Clipboard {
+                text: s.to_string(),
+            },
+            out,
+        )
     })
 }
 
@@ -338,7 +347,11 @@ mod tests {
             ("OPENVNC_EPROTO", OPENVNC_EPROTO),
             ("OPENVNC_EPANIC", OPENVNC_EPANIC),
         ] {
-            let want = if v < 0 { format!("#define {k} ({v})") } else { format!("#define {k} {v}") };
+            let want = if v < 0 {
+                format!("#define {k} ({v})")
+            } else {
+                format!("#define {k} {v}")
+            };
             assert!(h.contains(&want), "{k} diverge do header");
         }
     }

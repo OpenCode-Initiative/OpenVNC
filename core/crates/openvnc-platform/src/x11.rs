@@ -135,7 +135,7 @@ impl X11Capture {
     /// MIT-SHM e opt-in (`OPENVNC_X11_SHM=1`) e so com o servidor X local:
     /// no Xvfb gastou mais CPU que GetImage (ver TD-004).
     fn local() -> bool {
-        if std::env::var_os("OPENVNC_X11_SHM").map_or(true, |v| v != "1") {
+        if std::env::var_os("OPENVNC_X11_SHM").is_none_or(|v| v != "1") {
             return false;
         }
         let d = std::env::var("DISPLAY").unwrap_or_default();

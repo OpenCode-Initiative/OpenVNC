@@ -13,7 +13,7 @@ openvnc-framebuffer.workspace = true
 flate2.workspace = true
 jpeg-decoder = { version = "0.3", default-features = false }
 # H.264 compilado do fonte da Cisco (BSD-2); nenhum binario pre-compilado
-openh264 = { version = "0.6", optional = true }
+openh264 = { version = "0.9", optional = true }
 
 [features]
 h264 = ["dep:openh264"]

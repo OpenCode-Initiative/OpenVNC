@@ -13,4 +13,4 @@ xsetroot -bitmap /usr/include/X11/bitmaps/gray3 -fg '#336699' -bg '#cc8844' 2>/d
   || xsetroot -solid '#336699'
 (xclock -geometry 400x400+100+100 >/dev/null 2>&1 &)
 sleep 1
-cargo test --release -p openvnc-platform x11::tests:: -- --ignored --nocapture
+cargo test --release -p openvnc-platform x11::tests:: -- --ignored --nocapture --test-threads=1

@@ -861,8 +861,12 @@ mod tests {
             .unwrap();
         assert!(matches!(ev, NativeEvent::Frame(ref r) if !r.is_empty()));
         assert!(c.framebuffer().data().iter().any(|&b| b != 0));
-        c.send_input(openvnc_protocol::Input::Pointer { x: 1, y: 1, buttons: 0 })
-            .unwrap();
+        c.send_input(openvnc_protocol::Input::Pointer {
+            x: 1,
+            y: 1,
+            buttons: 0,
+        })
+        .unwrap();
         c.close().await;
         // senha errada e recusada
         o.auth = NativeAuth::Password("errada".into());

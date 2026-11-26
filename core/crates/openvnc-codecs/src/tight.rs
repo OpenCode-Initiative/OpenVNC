@@ -58,18 +58,29 @@ fn decode_jpeg(r: Rect, data: &[u8], fb: &mut Framebuffer) -> Result<()> {
     let mut d = jpeg_decoder::Decoder::new(data);
     d.read_info()
         .map_err(|e| Error::Protocol(format!("tight jpeg: {e}")))?;
-    let info = d.info().ok_or_else(|| Error::Protocol("tight jpeg: sem info".into()))?;
+    let info = d
+        .info()
+        .ok_or_else(|| Error::Protocol("tight jpeg: sem info".into()))?;
     if info.width != r.width || info.height != r.height {
-        return Err(Error::Protocol("tight jpeg: dimensoes divergem do retangulo".into()));
+        return Err(Error::Protocol(
+            "tight jpeg: dimensoes divergem do retangulo".into(),
+        ));
     }
     let pix = d
         .decode()
         .map_err(|e| Error::Protocol(format!("tight jpeg: {e}")))?;
     let w = usize::from(r.width);
     let rgba: Vec<[u8; 4]> = match info.pixel_format {
-        jpeg_decoder::PixelFormat::RGB24 => pix.chunks_exact(3).map(|p| [p[0], p[1], p[2], 255]).collect(),
+        jpeg_decoder::PixelFormat::RGB24 => pix
+            .chunks_exact(3)
+            .map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
         jpeg_decoder::PixelFormat::L8 => pix.iter().map(|&v| [v, v, v, 255]).collect(),
-        _ => return Err(Error::Protocol("tight jpeg: formato de pixel nao suportado".into())),
+        _ => {
+            return Err(Error::Protocol(
+                "tight jpeg: formato de pixel nao suportado".into(),
+            ))
+        }
     };
     if rgba.len() != w * usize::from(r.height) {
         return Err(Error::Protocol("tight jpeg: tamanho incorreto".into()));
@@ -457,7 +468,9 @@ mod tests {
         }
         // JPEG corrompido
         let mut d = RectDecoder::new(Rect::new(0, 0, 4, 4), encoding::TIGHT).unwrap();
-        assert!(d.decode(&[0x90, 4, 1, 2, 3, 4], &PF, &mut f, &mut st).is_err());
+        assert!(d
+            .decode(&[0x90, 4, 1, 2, 3, 4], &PF, &mut f, &mut st)
+            .is_err());
         // filtro desconhecido
         let mut d = RectDecoder::new(Rect::new(0, 0, 4, 4), encoding::TIGHT).unwrap();
         assert!(d.decode(&[0x40, 7, 0, 0], &PF, &mut f, &mut st).is_err());

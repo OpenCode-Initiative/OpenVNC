@@ -10,9 +10,9 @@ use openvnc_core::{check_limit, Error, PixelFormat, Rect, Result};
 use openvnc_framebuffer::Framebuffer;
 
 pub mod encode;
+mod tight;
 #[cfg(feature = "h264")]
 pub mod video;
-mod tight;
 pub use encode::EncoderState;
 pub use tight::MAX_TIGHT_COMPRESSED;
 

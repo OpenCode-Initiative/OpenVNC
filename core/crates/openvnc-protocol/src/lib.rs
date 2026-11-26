@@ -360,7 +360,11 @@ fn encode_payload(m: &Message) -> Result<Vec<u8>> {
         } => {
             w.u16(*min_version);
             w.u16(*max_version);
-            check_limit("capabilities", capabilities.len() as u64, MAX_CAPABILITIES as u64)?;
+            check_limit(
+                "capabilities",
+                capabilities.len() as u64,
+                MAX_CAPABILITIES as u64,
+            )?;
             w.u16(capabilities.len() as u16);
             for c in capabilities {
                 w.u32(*c);
@@ -374,7 +378,11 @@ fn encode_payload(m: &Message) -> Result<Vec<u8>> {
             name,
         } => {
             w.u16(*version);
-            check_limit("capabilities", capabilities.len() as u64, MAX_CAPABILITIES as u64)?;
+            check_limit(
+                "capabilities",
+                capabilities.len() as u64,
+                MAX_CAPABILITIES as u64,
+            )?;
             w.u16(capabilities.len() as u16);
             for c in capabilities {
                 w.u32(*c);
@@ -657,7 +665,11 @@ pub fn decode_payload(ty: u16, payload: &[u8]) -> Result<Message> {
                 keysym: r.u32()?,
                 down: r.bool()?,
             }),
-            k => return Err(Error::Protocol(format!("tipo de entrada desconhecido: {k}"))),
+            k => {
+                return Err(Error::Protocol(format!(
+                    "tipo de entrada desconhecido: {k}"
+                )))
+            }
         },
         CURSOR_UPDATE => {
             let hot_x = r.u16()?;
@@ -712,7 +724,11 @@ pub fn decode_payload(ty: u16, payload: &[u8]) -> Result<Message> {
             code: r.u16()?,
             reason: r.str()?,
         },
-        t => return Err(Error::Protocol(format!("tipo de mensagem desconhecido: {t:#06x}"))),
+        t => {
+            return Err(Error::Protocol(format!(
+                "tipo de mensagem desconhecido: {t:#06x}"
+            )))
+        }
     };
     r.done()?;
     Ok(m)
@@ -772,7 +788,10 @@ pub fn parse_header(b: &[u8; HEADER_LEN], max_payload: u32) -> Result<Header> {
         )));
     }
     if h.flags & FLAG_RESERVED_MASK != 0 {
-        return Err(Error::Protocol(format!("flags reservadas: {:#06x}", h.flags)));
+        return Err(Error::Protocol(format!(
+            "flags reservadas: {:#06x}",
+            h.flags
+        )));
     }
     check_limit("payload", u64::from(h.length), u64::from(max_payload))?;
     Ok(h)
@@ -818,14 +837,20 @@ impl Decoder {
 
 /// Intersecao de capabilities preservando a ordem do cliente.
 pub fn negotiate_capabilities(client: &[u32], server: &[u32]) -> Vec<u32> {
-    let mut out: Vec<u32> = client.iter().copied().filter(|c| server.contains(c)).collect();
+    let mut out: Vec<u32> = client
+        .iter()
+        .copied()
+        .filter(|c| server.contains(c))
+        .collect();
     out.dedup();
     out
 }
 
 /// Escolhe a versao: a maior comum, ou `None`.
 pub fn negotiate_version(min: u16, max: u16) -> Option<u16> {
-    (min..=max).contains(&PROTOCOL_VERSION).then_some(PROTOCOL_VERSION)
+    (min..=max)
+        .contains(&PROTOCOL_VERSION)
+        .then_some(PROTOCOL_VERSION)
 }
 
 #[cfg(test)]
