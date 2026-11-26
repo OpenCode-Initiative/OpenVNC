@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod pairing;
+pub mod passhash;
 
 use des::cipher::{BlockEncrypt, KeyInit};
 use des::Des;

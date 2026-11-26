@@ -7,7 +7,10 @@
 
 mod config;
 mod diff;
+mod dpapi;
+mod files;
 mod native;
+mod tray;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -18,7 +21,7 @@ use openvnc_platform::{InputInjector, NullInjector, ScreenCapture, TestPattern};
 use openvnc_rfb::{PlainVerifier, Server, ServerConfig, ServerEvent};
 use openvnc_security::audit::AuditLog;
 use openvnc_security::pairing::{DeviceStore, Verdict};
-use openvnc_security::Password;
+use openvnc_security::{passhash, Password};
 use openvnc_transport::tls::{ServerIdentity, TlsAcceptor};
 use openvnc_transport::BoxStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,6 +65,9 @@ struct Cli {
     /// Diretorio de estado (certificado, dispositivos, auditoria).
     #[arg(long)]
     state_dir: Option<std::path::PathBuf>,
+    /// Mostra um icone na bandeja do sistema (Windows).
+    #[arg(long)]
+    tray: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -76,6 +82,11 @@ enum Cmd {
     /// Mostra (gerando se preciso) a impressao digital SHA-256 do
     /// certificado TLS, para conferir/fixar no cliente.
     Fingerprint,
+    /// Le uma senha da entrada padrao e imprime o hash Argon2id.
+    HashPassword,
+    /// Le uma senha da entrada padrao e imprime cifrada com DPAPI da
+    /// maquina (para `password_protected`).
+    ProtectPassword,
 }
 
 #[derive(Subcommand, Debug)]
@@ -156,17 +167,49 @@ fn main() -> anyhow::Result<()> {
             println!("{}", identity(&cfg)?.fingerprint());
             return Ok(());
         }
+        Some(Cmd::HashPassword) => {
+            println!(
+                "{}",
+                passhash::hash(&read_stdin_secret()?).map_err(anyhow::Error::msg)?
+            );
+            return Ok(());
+        }
+        Some(Cmd::ProtectPassword) => {
+            println!("{}", dpapi::protect(read_stdin_secret()?.as_bytes())?);
+            return Ok(());
+        }
         None => {}
     }
-    let password = cfg.resolve_password();
+    let mut password = cfg.resolve_password();
+    if password.is_none() {
+        if let Some(p) = &cfg.password_protected {
+            password = Some(dpapi::unprotect(p).context("decifrando password_protected")?);
+        }
+    }
     cfg.validate(&password)?;
 
     let rt = tokio::runtime::Runtime::new()?;
+    let tray = cli.tray;
+    let admin = cfg.admin_password_hash.is_some();
     rt.block_on(async move {
         let listener = TcpListener::bind(cfg.listen).await?;
         tracing::info!(addr = %listener.local_addr()?, capture = ?cfg.capture, "escutando");
+        files::set_sending(cfg.files_send);
+        if tray {
+            tray::spawn(listener.local_addr()?.port(), cfg.name.clone(), admin);
+        }
         run(listener, cfg, password).await
     })
+}
+
+fn read_stdin_secret() -> anyhow::Result<String> {
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    let s = s.trim_end_matches(['\r', '\n']).to_string();
+    if s.is_empty() {
+        anyhow::bail!("senha vazia");
+    }
+    Ok(s)
 }
 
 fn identity(cfg: &Config) -> anyhow::Result<ServerIdentity> {
@@ -288,6 +331,14 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
     }
     loop {
         let (sock, peer) = listener.accept().await?;
+        if !shared.cfg.peer_allowed(peer.ip()) {
+            tracing::warn!(%peer, "fora da rede local; recusado");
+            shared.audit.record(
+                "rejected",
+                &[("peer", &peer.to_string()), ("reason", "lan_only")],
+            );
+            continue;
+        }
         let n = shared.clients.load(Ordering::SeqCst);
         if n >= shared.cfg.max_clients {
             tracing::warn!(%peer, "limite de clientes; recusado");
@@ -298,6 +349,7 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
             continue;
         }
         shared.clients.fetch_add(1, Ordering::SeqCst);
+        tray::CLIENTS.fetch_add(1, Ordering::Relaxed);
         let sh = shared.clone();
         tokio::spawn(async move {
             tracing::info!(%peer, "conectado");
@@ -312,6 +364,7 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
                 sh.audit.record("disconnect", &[("peer", &p)]);
             }
             sh.clients.fetch_sub(1, Ordering::SeqCst);
+            tray::CLIENTS.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -451,8 +504,24 @@ fn plan(old: &Framebuffer, new: &Framebuffer, area: Rect) -> (Vec<(Rect, u16, u1
     (Vec::new(), clip(dirty))
 }
 
-fn verifier(st: DeviceStore, audit: Arc<AuditLog>, peer: String) -> PlainVerifier {
+fn verifier(
+    st: Option<DeviceStore>,
+    hash: Option<String>,
+    audit: Arc<AuditLog>,
+    peer: String,
+) -> PlainVerifier {
     PlainVerifier(Arc::new(move |user: &str, token: &[u8]| {
+        if user == config::REMOTE_USER || user.is_empty() {
+            let ok = hash.as_deref().is_some_and(|h| passhash::verify(token, h));
+            if !ok {
+                audit.record(
+                    "password_auth_failed",
+                    &[("peer", &peer), ("user", config::REMOTE_USER)],
+                );
+            }
+            return ok;
+        }
+        let Some(st) = &st else { return false };
         let v = st.verify(user, token);
         if v != Verdict::Ok {
             audit.record(
@@ -472,15 +541,19 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
     let mut srv = Server::new(
         ServerConfig {
             password: sh.password.clone().map(Password::new),
-            allow_no_auth: sh.cfg.allow_no_auth,
+            allow_no_auth: sh.cfg.allow_no_auth || sh.cfg.allow_attended,
             name: sh.cfg.name.clone(),
             challenge: challenge()?,
             vencrypt: sh.tls.is_some(),
             require_tls: sh.cfg.require_tls,
-            plain: sh
-                .devices
-                .clone()
-                .map(|d| verifier(d, sh.audit.clone(), peer.to_string())),
+            plain: (sh.devices.is_some() || sh.cfg.password_hash.is_some()).then(|| {
+                verifier(
+                    sh.devices.clone(),
+                    sh.cfg.password_hash.clone(),
+                    sh.audit.clone(),
+                    peer.to_string(),
+                )
+            }),
             ..Default::default()
         },
         first.fb.width(),
@@ -565,6 +638,14 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                 }
                 ServerEvent::Initialized { shared, version } => {
                     tracing::debug!(shared, ?version, "cliente pronto");
+                    // sem credencial, so com autorizacao local (allow_attended)
+                    let ask = sh.cfg.ask_before_accept
+                        || (srv.unauthenticated() && !sh.cfg.allow_no_auth);
+                    if ask && !tray::ask_accept(peer).await {
+                        sh.audit
+                            .record("rejected", &[("peer", peer), ("reason", "local_user")]);
+                        anyhow::bail!("recusado pelo usuario local");
+                    }
                     let enc = if srv.tls_subtype().is_some() {
                         "tls"
                     } else {
@@ -881,6 +962,107 @@ mod tests {
     #[tokio::test]
     async fn native_tcp_tls() {
         native_roundtrip(openvnc_client::native::NativeTransport::Tcp).await;
+    }
+
+    /// Envia um arquivo ao servidor e recebe outro dele, em loopback.
+    #[tokio::test]
+    async fn native_file_transfer() {
+        use openvnc_client::native::*;
+        use openvnc_transport::tls::{ClientTls, Trust};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cfg = tls_cfg(dir.path());
+        cfg.native_listen = Some(([127, 0, 0, 1], port).into());
+        cfg.files_send = true;
+        cfg.files_receive = true;
+        cfg.files_dir = Some(dir.path().join("srv-in"));
+        let fp = identity(&cfg).unwrap().fingerprint();
+        files::set_sending(true);
+        start(cfg, Some("teste")).await;
+        let o = NativeOptions {
+            address: format!("127.0.0.1:{port}"),
+            tls: ClientTls {
+                trust: Trust::Pinned(fp),
+            },
+            transport: NativeTransport::Tcp,
+            auth: NativeAuth::Password("teste".into()),
+            timeout: Duration::from_secs(5),
+        };
+        let mut c = None;
+        for _ in 0..50 {
+            match NativeClient::connect(&o).await {
+                Ok(x) => {
+                    c = Some(x);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let mut c = c.expect("conexao nativa");
+        c.set_download_dir(dir.path().join("cli-in"), u64::MAX);
+        async fn ev(c: &mut NativeClient) -> NativeEvent {
+            tokio::time::timeout(Duration::from_secs(10), c.next_event())
+                .await
+                .expect("tempo esgotado")
+                .expect("evento")
+        }
+
+        // cliente -> servidor (mais de um bloco)
+        let up: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let src = dir.path().join("subida.bin");
+        std::fs::write(&src, &up).unwrap();
+        let id = c.offer_file(src).unwrap();
+        let mut answered = false;
+        loop {
+            match ev(&mut c).await {
+                NativeEvent::FileAnswer { id: i, accepted } if i == id => {
+                    assert!(accepted);
+                    answered = true;
+                }
+                NativeEvent::FileSent { id: i, bytes } if i == id => {
+                    assert_eq!(bytes, up.len() as u64);
+                    break;
+                }
+                NativeEvent::FileFailed { reason, .. } => panic!("{reason}"),
+                _ => {}
+            }
+        }
+        assert!(answered);
+        let dest = dir.path().join("srv-in").join("subida.bin");
+        let mut ok = false;
+        for _ in 0..100 {
+            if std::fs::read(&dest).ok().as_deref() == Some(&up[..]) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ok, "servidor nao gravou o arquivo");
+
+        // servidor -> cliente (a sessao ja assinou as ofertas)
+        let down = b"ola do servidor".to_vec();
+        let src = dir.path().join("descida.txt");
+        std::fs::write(&src, &down).unwrap();
+        assert!(files::offer_file(src) >= 1);
+        let got = loop {
+            match ev(&mut c).await {
+                NativeEvent::FileOffer { id, name, size } if name == "descida.txt" => {
+                    assert_eq!(size, down.len() as u64);
+                    c.accept_file(id).unwrap();
+                }
+                NativeEvent::FileOffer { id, .. } => c.reject_file(id).unwrap(),
+                NativeEvent::FileReceived { path, .. } => break path,
+                NativeEvent::FileFailed { reason, .. } => panic!("{reason}"),
+                _ => {}
+            }
+        };
+        assert_eq!(std::fs::read(got).unwrap(), down);
+        c.close().await;
     }
 
     #[tokio::test]

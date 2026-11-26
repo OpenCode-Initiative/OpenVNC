@@ -21,6 +21,8 @@ openvnc-platform.workspace = true
 openvnc-security.workspace = true
 openvnc-transport.workspace = true
 openvnc-protocol.workspace = true
+sha2.workspace = true
+openvnc-client.workspace = true
 flate2.workspace = true
 quinn.workspace = true
 tokio.workspace = true
@@ -32,6 +34,16 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 getrandom = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_UI_Controls_Dialogs",
+  "Win32_Security_Cryptography",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 [features]
 default = ["h264"]
 # Codificacao de video H.264 no protocolo nativo
@@ -40,7 +52,6 @@ wayland = ["openvnc-platform/wayland"]
 
 [dev-dependencies]
 tempfile = "3"
-openvnc-client.workspace = true
 
 [lints]
 workspace = true

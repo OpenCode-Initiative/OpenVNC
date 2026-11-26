@@ -4,9 +4,12 @@
 //! TCP+TLS na mesma porta. A verificacao do certificado e a mesma nos dois
 //! transportes ([`ClientTls`]), entao o fallback nunca reduz a seguranca.
 
+use std::collections::HashMap;
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::files::{self, Inbound};
 use openvnc_core::{Error, Rect, Result};
 use openvnc_framebuffer::{Framebuffer, DEFAULT_MAX_BYTES};
 use openvnc_protocol::io::{read_message, write_message};
@@ -92,6 +95,36 @@ pub struct NativeClient {
     quic: Option<(quinn::Endpoint, quinn::Connection)>,
     #[cfg(feature = "h264")]
     video: Option<openvnc_codecs::video::H264Decoder>,
+    xfer: Transfers,
+    files_only: bool,
+}
+
+/// Estado da transferencia de arquivos da sessao.
+struct Transfers {
+    /// Pasta e limite de recebimento (`None`: recusa ofertas).
+    inbound: Option<Inbound>,
+    /// Ofertas do servidor aguardando decisao: id -> (nome, tamanho).
+    offered: HashMap<u32, (String, u64)>,
+    /// Nossas ofertas aguardando FILE_ACCEPT.
+    pending: HashMap<u32, PathBuf>,
+    next: u32,
+    /// Eventos das tarefas de envio em segundo plano.
+    ev_tx: mpsc::UnboundedSender<NativeEvent>,
+    ev_rx: mpsc::UnboundedReceiver<NativeEvent>,
+}
+
+impl Transfers {
+    fn new() -> Self {
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        Self {
+            inbound: None,
+            offered: HashMap::new(),
+            pending: HashMap::new(),
+            next: 0,
+            ev_tx,
+            ev_rx,
+        }
+    }
 }
 
 impl std::fmt::Debug for NativeClient {
@@ -112,6 +145,55 @@ pub enum NativeEvent {
     Resized(u16, u16),
     /// Clipboard do servidor.
     Clipboard(String),
+    /// O servidor oferece um arquivo: responda com
+    /// [`NativeClient::accept_file`] ou [`NativeClient::reject_file`].
+    FileOffer {
+        /// Identificador da oferta.
+        id: u32,
+        /// Nome (ja saneado pelo protocolo).
+        name: String,
+        /// Tamanho anunciado em bytes.
+        size: u64,
+    },
+    /// Progresso de um recebimento.
+    FileProgress {
+        /// Identificador da oferta.
+        id: u32,
+        /// Bytes recebidos ate agora.
+        done: u64,
+        /// Tamanho total.
+        total: u64,
+    },
+    /// Arquivo recebido e conferido (SHA-256).
+    FileReceived {
+        /// Identificador da oferta.
+        id: u32,
+        /// Caminho final.
+        path: PathBuf,
+        /// Tamanho em bytes.
+        size: u64,
+    },
+    /// Resposta do servidor a uma oferta nossa.
+    FileAnswer {
+        /// Identificador da nossa oferta.
+        id: u32,
+        /// Aceitou?
+        accepted: bool,
+    },
+    /// Envio concluido.
+    FileSent {
+        /// Identificador da nossa oferta.
+        id: u32,
+        /// Bytes enviados.
+        bytes: u64,
+    },
+    /// Falha em uma transferencia (em qualquer sentido).
+    FileFailed {
+        /// Identificador da oferta.
+        id: u32,
+        /// Motivo.
+        reason: String,
+    },
 }
 
 fn perr(s: impl Into<String>) -> Error {
@@ -235,9 +317,14 @@ impl NativeClient {
                     capability::TILE_RAW,
                     capability::TILE_ZLIB,
                     capability::VIDEO_H264,
+                    capability::FILE_TRANSFER,
                 ]
             } else {
-                vec![capability::TILE_RAW, capability::TILE_ZLIB]
+                vec![
+                    capability::TILE_RAW,
+                    capability::TILE_ZLIB,
+                    capability::FILE_TRANSFER,
+                ]
             },
             name: format!("openvnc-client {}", crate::VERSION),
         })?;
@@ -298,6 +385,8 @@ impl NativeClient {
             quic,
             #[cfg(feature = "h264")]
             video: None,
+            xfer: Transfers::new(),
+            files_only: false,
         })
     }
 
@@ -324,12 +413,58 @@ impl NativeClient {
     /// Espera a proxima atualizacao, aplica e confirma.
     pub async fn next_event(&mut self) -> Result<NativeEvent> {
         loop {
-            let m = self
-                .inbox
-                .recv()
-                .await
-                .ok_or_else(|| perr("conexao encerrada"))?;
+            let m = tokio::select! {
+                m = self.inbox.recv() => m.ok_or_else(|| perr("conexao encerrada"))?,
+                Some(ev) = self.xfer.ev_rx.recv() => return Ok(ev),
+            };
             match m {
+                Message::FileOffer { id, name, size } => {
+                    if self.xfer.inbound.is_none() || self.xfer.offered.len() >= 16 {
+                        self.send(Chan::Control, Message::FileAccept { id, accept: false })?;
+                        continue;
+                    }
+                    self.xfer.offered.insert(id, (name.clone(), size));
+                    return Ok(NativeEvent::FileOffer { id, name, size });
+                }
+                Message::FileChunk { id, offset, data } => {
+                    let Some(inb) = self.xfer.inbound.as_mut() else {
+                        continue;
+                    };
+                    match inb.chunk(id, offset, &data) {
+                        Ok(()) => {
+                            let done = offset + data.len() as u64;
+                            let total = inb.size_of(id).unwrap_or(done);
+                            return Ok(NativeEvent::FileProgress { id, done, total });
+                        }
+                        Err(reason) => return Ok(NativeEvent::FileFailed { id, reason }),
+                    }
+                }
+                Message::FileEnd { id, sha256 } => {
+                    let Some(inb) = self.xfer.inbound.as_mut() else {
+                        continue;
+                    };
+                    return Ok(match inb.end(id, &sha256) {
+                        Ok(r) => NativeEvent::FileReceived {
+                            id,
+                            path: r.path,
+                            size: r.size,
+                        },
+                        Err(reason) => NativeEvent::FileFailed { id, reason },
+                    });
+                }
+                Message::FileAccept { id, accept } => {
+                    let Some(path) = self.xfer.pending.remove(&id) else {
+                        continue;
+                    };
+                    if accept {
+                        self.spawn_stream(id, path);
+                    }
+                    return Ok(NativeEvent::FileAnswer {
+                        id,
+                        accepted: accept,
+                    });
+                }
+                Message::FrameUpdate { .. } if self.files_only => {}
                 Message::FrameUpdate { seq, rects } => {
                     let mut out = Vec::with_capacity(rects.len());
                     for r in &rects {
@@ -382,6 +517,101 @@ impl NativeClient {
 
     fn send(&self, c: Chan, m: Message) -> Result<()> {
         self.out.send((c, m)).map_err(|_| perr("conexao encerrada"))
+    }
+
+    /// Sessao usada so para arquivos: quadros sao descartados sem
+    /// FRAME_ACK, e o servidor para de enviar video apos a janela inicial.
+    pub fn set_files_only(&mut self, on: bool) {
+        self.files_only = on;
+    }
+
+    /// Habilita o recebimento de arquivos em `dir`, com limite por arquivo.
+    /// Sem isso, ofertas do servidor sao recusadas automaticamente.
+    pub fn set_download_dir(&mut self, dir: PathBuf, max_bytes: u64) {
+        self.xfer.inbound = Some(Inbound::new(dir, max_bytes));
+    }
+
+    /// Aceita uma oferta recebida em [`NativeEvent::FileOffer`]. Retorna o
+    /// caminho temporario onde os blocos serao gravados.
+    pub fn accept_file(&mut self, id: u32) -> Result<PathBuf> {
+        let (name, size) = self
+            .xfer
+            .offered
+            .remove(&id)
+            .ok_or_else(|| perr("oferta desconhecida"))?;
+        let inb = self
+            .xfer
+            .inbound
+            .as_mut()
+            .ok_or_else(|| perr("recebimento desabilitado"))?;
+        match inb.offer(id, &name, size) {
+            Ok(p) => {
+                self.send(Chan::Control, Message::FileAccept { id, accept: true })?;
+                Ok(p)
+            }
+            Err(e) => {
+                self.send(Chan::Control, Message::FileAccept { id, accept: false })?;
+                Err(perr(e))
+            }
+        }
+    }
+
+    /// Recusa uma oferta recebida.
+    pub fn reject_file(&mut self, id: u32) -> Result<()> {
+        self.xfer.offered.remove(&id);
+        self.send(Chan::Control, Message::FileAccept { id, accept: false })
+    }
+
+    /// Oferece um arquivo ao servidor. A resposta chega como
+    /// [`NativeEvent::FileAnswer`] e, se aceito, o envio segue em segundo
+    /// plano ate [`NativeEvent::FileSent`] ou [`NativeEvent::FileFailed`].
+    pub fn offer_file(&mut self, path: PathBuf) -> Result<u32> {
+        let meta = std::fs::metadata(&path)?;
+        if !meta.is_file() {
+            return Err(perr("nao e um arquivo"));
+        }
+        if self.xfer.pending.len() >= 16 {
+            return Err(perr("ofertas demais aguardando resposta"));
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| perr("caminho sem nome"))?
+            .to_string_lossy()
+            .into_owned();
+        let name = openvnc_protocol::sanitize_file_name(&name).map_err(|e| perr(e.to_string()))?;
+        self.xfer.next = self.xfer.next.wrapping_add(1);
+        let id = self.xfer.next;
+        self.send(
+            Chan::Control,
+            Message::FileOffer {
+                id,
+                name,
+                size: meta.len(),
+            },
+        )?;
+        self.xfer.pending.insert(id, path);
+        Ok(id)
+    }
+
+    fn spawn_stream(&self, id: u32, path: PathBuf) {
+        let out = self.out.clone();
+        let ev = self.xfer.ev_tx.clone();
+        let (tx, mut rx) = mpsc::channel::<Message>(4);
+        // ponte: canal limitado (contrapressao na leitura) -> canal de controle
+        tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                if out.send((Chan::Control, m)).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let r = files::stream(id, &path, &tx).await;
+            let _ = ev.send(match r {
+                Ok(bytes) => NativeEvent::FileSent { id, bytes },
+                Err(reason) => NativeEvent::FileFailed { id, reason },
+            });
+        });
     }
 
     /// Envia um evento de entrada.

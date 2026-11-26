@@ -17,6 +17,7 @@ quinn.workspace = true
 openvnc-transport.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+sha2.workspace = true
 openvnc-codecs = { workspace = true, optional = true }
 
 [features]

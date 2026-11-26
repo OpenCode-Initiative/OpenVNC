@@ -140,6 +140,8 @@ pub struct Server {
     height: u16,
     enc: EncoderState,
     subtype: Option<u32>,
+    /// Sessao sem autenticacao (None ou X509None).
+    no_auth: bool,
 }
 
 impl Server {
@@ -172,6 +174,7 @@ impl Server {
             height,
             enc: EncoderState::default(),
             subtype: None,
+            no_auth: false,
         })
     }
 
@@ -257,6 +260,11 @@ impl Server {
         self.subtype
     }
 
+    /// O cliente entrou sem credencial (tipo None ou X509None).
+    pub fn unauthenticated(&self) -> bool {
+        self.no_auth
+    }
+
     /// Chamado pelo driver quando o handshake TLS terminou.
     pub fn tls_established(&mut self) -> Result<()> {
         if self.state != SState::TlsPending {
@@ -269,6 +277,7 @@ impl Server {
             }
             Some(vencrypt::X509_PLAIN) => SState::PlainCreds,
             _ => {
+                self.no_auth = true;
                 self.out.extend_from_slice(&0u32.to_be_bytes());
                 SState::ClientInit
             }
@@ -315,6 +324,7 @@ impl Server {
             self.out.extend_from_slice(&self.cfg.challenge);
             self.state = SState::VncResponse;
         } else {
+            self.no_auth = true;
             if self.version == ProtocolVersion::V3_8 {
                 self.out.extend_from_slice(&0u32.to_be_bytes());
             }

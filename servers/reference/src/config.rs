@@ -63,7 +63,37 @@ pub struct Config {
     /// Diretorio de estado. Padrao: `OPENVNC_SERVER_DIR`, senao
     /// `%APPDATA%/openvnc-server` ou `~/.local/share/openvnc-server`.
     pub state_dir: Option<PathBuf>,
+    /// Hash Argon2id (PHC) da senha de acesso remoto. Conferido no
+    /// X509Plain (usuario [`REMOTE_USER`], dentro do TLS).
+    pub password_hash: Option<String>,
+    /// Senha cifrada com DPAPI da maquina (hex), so para clientes VNC
+    /// antigos (VNC Auth). Ausente = sem compatibilidade.
+    pub password_protected: Option<String>,
+    /// Hash Argon2id da senha de administracao local (Configuracoes e
+    /// "Parar o servidor").
+    pub admin_password_hash: Option<String>,
+    /// O assistente de configuracao ja foi concluido.
+    pub setup_done: bool,
+    /// Aceitar so enderecos de rede local (privados, loopback, link-local).
+    pub lan_only: bool,
+    /// Perguntar ao usuario local antes de aceitar cada conexao.
+    pub ask_before_accept: bool,
+    /// Permitir conexao sem senha, desde que o usuario local autorize na
+    /// hora (como o AnyDesk). Quem entra com senha ou dispositivo pareado
+    /// nao passa pela pergunta.
+    pub allow_attended: bool,
+    /// Permitir enviar arquivos deste computador ao cliente.
+    pub files_send: bool,
+    /// Permitir receber arquivos do cliente.
+    pub files_receive: bool,
+    /// Pasta de recebimento. Padrao: `Downloads\OpenVNC` do usuario.
+    pub files_dir: Option<PathBuf>,
+    /// Tamanho maximo de cada arquivo recebido, em MiB.
+    pub files_max_mb: u64,
 }
+
+/// Usuario do X509Plain que autentica com a senha de acesso remoto.
+pub const REMOTE_USER: &str = "openvnc";
 
 impl Default for Config {
     fn default() -> Self {
@@ -88,6 +118,17 @@ impl Default for Config {
             audit_log: None,
             native_listen: None,
             state_dir: None,
+            password_hash: None,
+            password_protected: None,
+            admin_password_hash: None,
+            setup_done: false,
+            lan_only: false,
+            ask_before_accept: false,
+            allow_attended: false,
+            files_send: false,
+            files_receive: false,
+            files_dir: None,
+            files_max_mb: 1024,
         }
     }
 }
@@ -153,13 +194,50 @@ impl Config {
             .or_else(|| (self.tls || self.pairing).then(|| self.state_dir().join("audit.log")))
     }
 
+    /// Pasta de recebimento efetiva.
+    pub fn files_dir(&self) -> PathBuf {
+        if let Some(d) = &self.files_dir {
+            return d.clone();
+        }
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.state_dir());
+        home.join("Downloads").join("OpenVNC")
+    }
+
+    /// `ip` e aceito com `lan_only`?
+    pub fn peer_allowed(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        if !self.lan_only {
+            return true;
+        }
+        match ip {
+            IpAddr::V4(v) => v.is_private() || v.is_loopback() || v.is_link_local(),
+            IpAddr::V6(v) => match v.to_ipv4_mapped() {
+                Some(m) => m.is_private() || m.is_loopback() || m.is_link_local(),
+                None => {
+                    v.is_loopback()
+                        || (v.segments()[0] & 0xfe00) == 0xfc00
+                        || (v.segments()[0] & 0xffc0) == 0xfe80
+                }
+            },
+        }
+    }
+
     /// Valida combinacoes perigosas. Normaliza `require_tls -> tls`.
     pub fn validate(&mut self, password: &Option<String>) -> anyhow::Result<()> {
         self.tls |= self.require_tls;
         if self.pairing && !self.tls {
             anyhow::bail!("pairing exige tls (o token so trafega dentro do TLS)");
         }
-        let has_auth = password.is_some() || self.pairing;
+        if self.password_hash.is_some() && !self.tls {
+            anyhow::bail!("password_hash exige tls (a senha so trafega dentro do TLS)");
+        }
+        let has_auth = password.is_some()
+            || self.pairing
+            || self.password_hash.is_some()
+            || self.allow_attended;
         if !has_auth && !self.allow_no_auth {
             anyhow::bail!(
                 "sem senha: defina OPENVNC_PASSWORD (ou `password`), use pairing = true ou allow_no_auth = true"
@@ -225,6 +303,18 @@ mod tests {
         assert_eq!(c.capture, CaptureKind::Native);
         assert_eq!(c.max_fps, 15);
         assert!(Config::from_toml("senha = \"x\"").is_err());
+    }
+
+    #[test]
+    fn lan_only() {
+        let c = Config {
+            lan_only: true,
+            ..Default::default()
+        };
+        assert!(c.peer_allowed("192.168.0.5".parse().unwrap()));
+        assert!(c.peer_allowed("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!c.peer_allowed("8.8.8.8".parse().unwrap()));
+        assert!(Config::default().peer_allowed("8.8.8.8".parse().unwrap()));
     }
 
     #[test]

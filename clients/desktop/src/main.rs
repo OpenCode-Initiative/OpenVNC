@@ -5,10 +5,12 @@
 
 mod input;
 mod native;
+mod transfer;
 
 use std::sync::Arc;
 
 use eframe::egui;
+use openvnc_client::native::NativeAuth;
 use openvnc_client::{Command, ConnectOptions, Session, SessionEvent};
 use openvnc_core::PointerEvent;
 use openvnc_rfb::Password;
@@ -46,6 +48,7 @@ fn main() -> eframe::Result<()> {
         "OpenVNC",
         opts,
         Box::new(move |cc| {
+            ui_style(&cc.egui_ctx);
             let mut app = App::new();
             if let Some(t) = target {
                 app.host = t;
@@ -167,6 +170,12 @@ struct Remote {
     last_pos: (u16, u16),
     /// Cursor remoto (textura, ponto quente).
     cursor: Option<(egui::TextureHandle, egui::Vec2)>,
+    /// Conexao nativa de arquivos (aberta apos o RFB conectar, se houver TLS).
+    files: Option<transfer::FileLink>,
+    /// Endereco nativo e credenciais para abrir `files`.
+    files_plan: Option<(String, NativeAuth)>,
+    show_files: bool,
+    send_path: String,
 }
 
 struct App {
@@ -184,6 +193,44 @@ struct App {
     /// Senha guardada enquanto se decide uma confirmacao TOFU.
     pending_password: String,
     trust: Option<TrustIssue>,
+    /// Porta do protocolo nativo (arquivos); vazio = porta + 1.
+    files_port: String,
+    /// Porta VNC usada quando o endereco nao traz uma.
+    port: String,
+}
+
+/// Textos e campos maiores, com mais respiro.
+fn ui_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+    ctx.all_styles_mut(|s| {
+        s.text_styles = [
+            (
+                TextStyle::Heading,
+                FontId::new(28.0, FontFamily::Proportional),
+            ),
+            (TextStyle::Body, FontId::new(17.0, FontFamily::Proportional)),
+            (
+                TextStyle::Button,
+                FontId::new(17.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Small,
+                FontId::new(14.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Monospace,
+                FontId::new(15.0, FontFamily::Monospace),
+            ),
+        ]
+        .into();
+        s.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        s.spacing.button_padding = egui::vec2(12.0, 7.0);
+        s.spacing.interact_size.y = 34.0;
+        s.spacing.icon_width = 20.0;
+        s.visuals.widgets.inactive.corner_radius = 6.0.into();
+        s.visuals.widgets.hovered.corner_radius = 6.0.into();
+        s.visuals.widgets.active.corner_radius = 6.0.into();
+    });
 }
 
 impl App {
@@ -194,7 +241,7 @@ impl App {
                 .enable_all()
                 .build()
                 .expect("runtime tokio"),
-            host: "localhost:0".into(),
+            host: String::new(),
             password: String::new(),
             shared: true,
             scale: Scale::Fit,
@@ -205,6 +252,34 @@ impl App {
             user: String::new(),
             pending_password: String::new(),
             trust: None,
+            files_port: String::new(),
+            port: "5900".into(),
+        }
+    }
+
+    /// Endereco final: se o campo ja traz porta ou display, vale como esta;
+    /// senao junta o host com a porta escolhida.
+    fn target(&self) -> String {
+        let h = self.host.trim();
+        let port = match self.port.trim() {
+            "" => "5900",
+            p => p,
+        };
+        let colons = h.matches(':').count();
+        if h.starts_with('[') {
+            if h.ends_with(']') {
+                format!("{h}:{port}")
+            } else {
+                h.to_string()
+            }
+        } else if colons > 2 || h.starts_with("::") {
+            // IPv6 sem colchetes
+            format!("[{h}]:{port}")
+        } else if colons > 0 {
+            // host:display ou host::porta digitados a mao
+            h.to_string()
+        } else {
+            format!("{h}::{port}")
         }
     }
 
@@ -213,7 +288,7 @@ impl App {
     }
 
     fn connect_with(&mut self, ctx: &egui::Context, accept_new: bool) {
-        let addr = match openvnc_transport::parse_address(&self.host) {
+        let addr = match openvnc_transport::parse_address(&self.target()) {
             Ok(a) => a,
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -238,6 +313,29 @@ impl App {
             // guarda a senha caso seja preciso reconectar apos confirmar o host
             self.pending_password = self.password.clone();
         }
+        let files_port = match self.files_port.trim() {
+            "" => Ok(addr
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .map_or(5901, |p| p.wrapping_add(1))),
+            p => p.parse::<u16>(),
+        };
+        let files_plan = match (o.tls.is_some(), files_port) {
+            (true, Ok(port)) if port > 0 => {
+                let auth = if !self.user.is_empty() {
+                    NativeAuth::Device {
+                        id: self.user.clone(),
+                        token: self.password.clone(),
+                    }
+                } else if !self.password.is_empty() {
+                    NativeAuth::Password(self.password.clone())
+                } else {
+                    NativeAuth::None
+                };
+                Some((transfer::native_address(&addr, port), auth))
+            }
+            _ => None,
+        };
         if !self.password.is_empty() {
             o.config.password = Some(Password::new(std::mem::take(&mut self.password)));
         }
@@ -258,6 +356,10 @@ impl App {
             buttons: 0,
             last_pos: (0, 0),
             cursor: None,
+            files: None,
+            files_plan,
+            show_files: false,
+            send_path: String::new(),
         });
     }
 
@@ -327,83 +429,155 @@ impl App {
             return;
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
-                ui.heading("OpenVNC");
-                ui.add_space(20.0);
-                egui::Grid::new("conn").num_columns(2).show(ui, |ui| {
-                    ui.label("Servidor");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.host).hint_text("host:display ou host::porta"),
+            // Cartao centralizado: largura acompanha a janela (ate 460 px)
+            let avail = ui.available_size();
+            let w = (avail.x - 32.0).clamp(280.0, 520.0);
+            let est = if self.security == Security::None {
+                440.0
+            } else {
+                400.0
+            };
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    ui.add_space(((avail.y - est) / 2.0).max(16.0));
+                    ui.vertical_centered(|ui| {
+                        ui.set_max_width(w);
+                        egui::Frame::group(ui.style())
+                            .inner_margin(egui::Margin::same(28))
+                            .corner_radius(12.0)
+                            .show(ui, |ui| {
+                                ui.set_width(w - 56.0);
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    self.connect_form(ui);
+                                });
+                            });
+                    });
+                });
+        });
+    }
+
+    fn connect_form(&mut self, ui: &mut egui::Ui) {
+        let field = |ui: &mut egui::Ui, label: &str| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(label).strong());
+        };
+        fn big(t: egui::TextEdit<'_>) -> egui::TextEdit<'_> {
+            t.margin(egui::vec2(10.0, 8.0)).font(egui::TextStyle::Body)
+        }
+        ui.vertical_centered(|ui| {
+            ui.heading(egui::RichText::new("OpenVNC").size(34.0).strong());
+            ui.label(egui::RichText::new("Acesse outro computador").weak());
+        });
+        ui.add_space(14.0);
+        field(ui, "Endereco do computador");
+        let r = ui
+            .horizontal(|ui| {
+                let pw = 90.0;
+                let r = ui.add(big(egui::TextEdit::singleline(&mut self.host)
+                    .hint_text("ex.: 192.168.0.10 ou nome-do-pc")
+                    .desired_width(ui.available_width() - pw - 10.0)));
+                ui.add(big(egui::TextEdit::singleline(&mut self.port)
+                    .hint_text("5900")
+                    .desired_width(pw)))
+                    .on_hover_text(
+                        "Porta do servidor (padrao 5900). So mude se o servidor usar outra.",
                     );
-                    ui.end_row();
-                    ui.label("Seguranca");
-                    egui::ComboBox::from_id_salt("sec")
-                        .selected_text(self.security.label())
-                        .show_ui(ui, |ui| {
-                            for m in [
-                                Security::Tofu,
-                                Security::WebPki,
-                                Security::Pin,
-                                Security::Ca,
-                                Security::None,
-                            ] {
-                                ui.selectable_value(&mut self.security, m, m.label());
-                            }
-                        });
-                    ui.end_row();
-                    match self.security {
-                        Security::Pin => {
-                            ui.label("SHA-256");
-                            ui.add(egui::TextEdit::singleline(&mut self.tls_arg).hint_text("AB:CD:..."));
-                            ui.end_row();
-                        }
-                        Security::Ca => {
-                            ui.label("CA (PEM)");
-                            ui.add(egui::TextEdit::singleline(&mut self.tls_arg).hint_text("caminho do arquivo"));
-                            ui.end_row();
-                        }
-                        _ => {}
-                    }
-                    if self.security != Security::None {
-                        ui.label("Dispositivo");
-                        ui.add(egui::TextEdit::singleline(&mut self.user).hint_text("opcional (servidor com --pairing)"));
-                        ui.end_row();
-                    }
-                    ui.label(if self.user.is_empty() { "Senha" } else { "Token" });
-                    let p = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut self.shared, "Sessao compartilhada");
-                    ui.end_row();
-                    let enter = (r.lost_focus() || p.lost_focus())
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if enter {
-                        self.connect(ui.ctx());
+                r
+            })
+            .inner;
+        field(
+            ui,
+            if self.user.is_empty() {
+                "Senha"
+            } else {
+                "Token do dispositivo"
+            },
+        );
+        let p = ui.add(big(egui::TextEdit::singleline(&mut self.password)
+            .password(true)
+            .hint_text("senha de acesso remoto")
+            .desired_width(f32::INFINITY)));
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Opcoes avancadas").show(ui, |ui| {
+            field(ui, "Seguranca");
+            egui::ComboBox::from_id_salt("sec")
+                .width(ui.available_width())
+                .selected_text(self.security.label())
+                .show_ui(ui, |ui| {
+                    for m in [
+                        Security::Tofu,
+                        Security::WebPki,
+                        Security::Pin,
+                        Security::Ca,
+                        Security::None,
+                    ] {
+                        ui.selectable_value(&mut self.security, m, m.label());
                     }
                 });
-                ui.add_space(10.0);
-                if ui.button("Conectar").clicked() {
-                    self.connect(ui.ctx());
+            match self.security {
+                Security::Pin => {
+                    field(ui, "Impressao digital SHA-256");
+                    ui.add(big(egui::TextEdit::singleline(&mut self.tls_arg)
+                        .hint_text("AB:CD:...")
+                        .desired_width(f32::INFINITY)));
                 }
-                ui.add_space(10.0);
-                if self.security == Security::None {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 0),
-                    "Conexoes VNC legadas NAO sao criptografadas. Use um tunel SSH\n(ssh -L 5901:localhost:5901 host) em redes nao confiaveis.",
-                );
+                Security::Ca => {
+                    field(ui, "CA (PEM)");
+                    ui.add(big(egui::TextEdit::singleline(&mut self.tls_arg)
+                        .hint_text("caminho do arquivo")
+                        .desired_width(f32::INFINITY)));
                 }
-                if let Some(e) = &self.error {
-                    ui.add_space(10.0);
-                    ui.colored_label(egui::Color32::RED, e);
-                }
-            });
+                _ => {}
+            }
+            if self.security != Security::None {
+                field(ui, "Usuario do dispositivo pareado");
+                ui.add(big(egui::TextEdit::singleline(&mut self.user)
+                    .hint_text("vazio = entrar com a senha")
+                    .desired_width(f32::INFINITY)));
+                field(ui, "Porta de arquivos");
+                ui.add(big(egui::TextEdit::singleline(&mut self.files_port)
+                    .hint_text("automatica (porta + 1)")
+                    .desired_width(f32::INFINITY)));
+            }
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.shared, "Sessao compartilhada")
+                .on_hover_text("Permite que outras pessoas fiquem conectadas ao mesmo tempo.");
         });
+        let enter =
+            (r.lost_focus() || p.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.add_space(16.0);
+        let btn = egui::Button::new(
+            egui::RichText::new("Conectar")
+                .size(19.0)
+                .strong()
+                .color(egui::Color32::WHITE),
+        )
+        .fill(egui::Color32::from_rgb(0x2F, 0x6F, 0xEB))
+        .corner_radius(8.0)
+        .min_size(egui::vec2(ui.available_width(), 44.0));
+        let ok = !self.host.trim().is_empty();
+        if (ui.add_enabled(ok, btn).clicked() || enter) && ok {
+            self.connect(ui.ctx());
+        }
+        if self.security == Security::None {
+            ui.add_space(10.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 0),
+                "Conexoes VNC legadas NAO sao criptografadas. Use um tunel SSH \
+                 (ssh -L 5901:localhost:5901 host) em redes nao confiaveis.",
+            );
+        }
+        if let Some(e) = &self.error {
+            ui.add_space(10.0);
+            ui.colored_label(egui::Color32::RED, e);
+        }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let (security, tls_arg) = (self.security, self.tls_arg.trim().to_string());
         let Some(remote) = self.remote.as_mut() else {
             self.connect_screen(ctx);
             return;
@@ -419,6 +593,20 @@ impl eframe::App for App {
                     ..
                 } => {
                     remote.connected = true;
+                    if let Some((addr, auth)) = remote.files_plan.take() {
+                        match files_tls(security, &tls_arg, &remote.title) {
+                            Ok(tls) => {
+                                remote.files = Some(transfer::FileLink::spawn(
+                                    self.rt.handle(),
+                                    addr,
+                                    tls,
+                                    auth,
+                                    ctx.clone(),
+                                ));
+                            }
+                            Err(e) => tracing::warn!("arquivos: {e:#}"),
+                        }
+                    }
                     remote.legacy_auth = legacy_auth;
                     remote.encrypted = encrypted;
                     remote.status = format!("{name} — {width}x{height}");
@@ -483,6 +671,10 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.scale, Scale::Fit, "Ajustar");
                 ui.selectable_value(&mut self.scale, Scale::Native, "1:1");
                 ui.separator();
+                if remote.files.is_some() {
+                    ui.toggle_value(&mut remote.show_files, "Arquivos");
+                    ui.separator();
+                }
                 ui.label(&remote.title);
                 ui.label(&remote.status);
                 if remote.encrypted {
@@ -495,6 +687,24 @@ impl eframe::App for App {
                 }
             });
         });
+        if let Some(link) = &remote.files {
+            let dropped: Vec<_> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            if !dropped.is_empty() {
+                remote.show_files = true;
+                for p in dropped {
+                    link.offer(p);
+                }
+            }
+            if remote.show_files {
+                files_panel(ctx, link, &mut remote.send_path);
+            }
+        }
         let scale = self.scale;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
@@ -547,6 +757,128 @@ impl eframe::App for App {
         if disconnect {
             self.remote = None;
         }
+    }
+}
+
+/// TLS da conexao de arquivos. No TOFU, fixa o certificado ja aceito para o
+/// endereco RFB (e o mesmo servidor, em outra porta).
+fn files_tls(mode: Security, arg: &str, rfb_addr: &str) -> anyhow::Result<ClientTls> {
+    if mode == Security::Tofu {
+        let store = KnownHosts::new(
+            KnownHosts::default_path()
+                .ok_or_else(|| anyhow::anyhow!("sem diretorio para known_hosts"))?,
+        );
+        let fp = store
+            .get(rfb_addr)?
+            .ok_or_else(|| anyhow::anyhow!("host ainda nao confirmado"))?;
+        return Ok(ClientTls {
+            trust: Trust::Pinned(fp),
+        });
+    }
+    build_tls(mode, arg, false)?.ok_or_else(|| anyhow::anyhow!("arquivos exigem TLS"))
+}
+
+fn files_panel(ctx: &egui::Context, link: &transfer::FileLink, send_path: &mut String) {
+    let Ok(s) = link.shared.lock() else {
+        return;
+    };
+    egui::SidePanel::right("files")
+        .resizable(true)
+        .default_width(300.0)
+        .show(ctx, |ui| {
+            ui.heading("Arquivos");
+            ui.label(egui::RichText::new(&s.status).small().weak());
+            ui.separator();
+            ui.add_enabled_ui(s.connected, |ui| {
+                ui.label("Enviar ao servidor (ou arraste arquivos para a janela):");
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(send_path)
+                            .hint_text("caminho do arquivo")
+                            .desired_width(ui.available_width() - 60.0),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button("Enviar").clicked() || enter) && !send_path.trim().is_empty() {
+                        let p = send_path.trim().trim_matches('"').to_string();
+                        link.offer(std::path::PathBuf::from(p));
+                        send_path.clear();
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Recebidos em {}", link.download_dir.display()))
+                        .small(),
+                );
+                if ui.small_button("Abrir pasta").clicked() {
+                    let _ = std::fs::create_dir_all(&link.download_dir);
+                    open_path(&link.download_dir);
+                }
+            });
+            for (id, name, size) in &s.offers {
+                ui.separator();
+                ui.label(format!(
+                    "O servidor quer enviar {name} ({})",
+                    transfer::human(*size)
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Aceitar").clicked() {
+                        link.accept(*id);
+                    }
+                    if ui.button("Recusar").clicked() {
+                        link.reject(*id);
+                    }
+                });
+            }
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if s.items.is_empty() {
+                    ui.label(egui::RichText::new("Nenhuma transferencia ainda.").weak());
+                }
+                for i in s.items.iter().rev() {
+                    let arrow = match i.dir {
+                        transfer::Dir::Up => "enviar",
+                        transfer::Dir::Down => "receber",
+                    };
+                    ui.label(egui::RichText::new(&i.name).strong());
+                    let frac = if i.size == 0 {
+                        if i.finished {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        i.done as f32 / i.size as f32
+                    };
+                    ui.add(egui::ProgressBar::new(frac).text(format!(
+                        "{arrow}: {} de {}",
+                        transfer::human(i.done),
+                        transfer::human(i.size)
+                    )));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&i.state).small());
+                        if let Some(p) = &i.path {
+                            if ui.small_button("Abrir").clicked() {
+                                open_path(p);
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        });
+}
+
+/// Abre um arquivo ou pasta no gerenciador do sistema.
+fn open_path(p: &std::path::Path) {
+    #[cfg(windows)]
+    let r = std::process::Command::new("explorer").arg(p).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(p).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(p).spawn();
+    if let Err(e) = r {
+        tracing::warn!("abrir {}: {e}", p.display());
     }
 }
 

@@ -155,6 +155,14 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
             let Ok((sock, peer)) = tcp.accept().await else {
                 continue;
             };
+            if !sh2.cfg.peer_allowed(peer.ip()) {
+                tracing::warn!(%peer, "fora da rede local; recusado (nativo)");
+                sh2.audit.record(
+                    "rejected",
+                    &[("peer", &peer.to_string()), ("reason", "lan_only")],
+                );
+                continue;
+            }
             let _ = sock.set_nodelay(true);
             let acc = acceptor.clone();
             let sh = sh2.clone();
@@ -198,7 +206,15 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
         };
         let sh = sh.clone();
         tokio::spawn(async move {
-            let peer = s.connection.remote_address().to_string();
+            let addr = s.connection.remote_address();
+            let peer = addr.to_string();
+            if !sh.cfg.peer_allowed(addr.ip()) {
+                tracing::warn!(%peer, "fora da rede local; recusado (quic)");
+                sh.audit
+                    .record("rejected", &[("peer", &peer), ("reason", "lan_only")]);
+                s.connection.close(5u32.into(), b"fora da rede local");
+                return;
+            }
             let Some(_slot) = Slot::take(&sh, &peer) else {
                 s.connection.close(4u32.into(), b"limite de clientes");
                 return;
@@ -232,6 +248,7 @@ impl<'a> Slot<'a> {
                 .record("rejected", &[("peer", peer), ("reason", "max_clients")]);
             return None;
         }
+        crate::tray::CLIENTS.fetch_add(1, Ordering::Relaxed);
         Some(Slot(sh))
     }
 }
@@ -239,6 +256,7 @@ impl<'a> Slot<'a> {
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.0.clients.fetch_sub(1, Ordering::SeqCst);
+        crate::tray::CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -291,13 +309,13 @@ async fn run_session(
 /// Metodos de autenticacao oferecidos pela configuracao.
 fn methods(sh: &Shared) -> Vec<u8> {
     let mut m = Vec::new();
-    if sh.password.is_some() {
+    if sh.password.is_some() || sh.cfg.password_hash.is_some() {
         m.push(auth_method::PASSWORD);
     }
     if sh.devices.is_some() {
         m.push(auth_method::DEVICE);
     }
-    if sh.cfg.allow_no_auth {
+    if sh.cfg.allow_no_auth || sh.cfg.allow_attended {
         m.push(auth_method::NONE);
     }
     m
@@ -322,8 +340,12 @@ fn check_auth(
     match method {
         auth_method::NONE => Ok(()),
         auth_method::PASSWORD => {
-            let pw = sh.password.as_deref().unwrap_or_default();
-            if ct_eq(pw.as_bytes(), secret) {
+            let ok = match (&sh.cfg.password_hash, &sh.password) {
+                (Some(h), _) => openvnc_security::passhash::verify(secret, h),
+                (None, Some(pw)) => ct_eq(pw.as_bytes(), secret),
+                (None, None) => false,
+            };
+            if ok {
                 Ok(())
             } else {
                 Err("senha incorreta".into())
@@ -363,7 +385,7 @@ async fn handshake(
     peer: &str,
     inbox: &mut mpsc::Receiver<Message>,
     ctrl: &mpsc::Sender<Message>,
-) -> anyhow::Result<Vec<u32>> {
+) -> anyhow::Result<(Vec<u32>, bool)> {
     let Some(Message::ClientHello {
         min_version,
         max_version,
@@ -383,15 +405,13 @@ async fn handshake(
         .await;
         bail!("versao {min_version}..={max_version} nao suportada");
     }
-    let ours: &[u32] = if cfg!(feature = "h264") {
-        &[
-            capability::TILE_RAW,
-            capability::TILE_ZLIB,
-            capability::VIDEO_H264,
-        ]
-    } else {
-        &[capability::TILE_RAW, capability::TILE_ZLIB]
-    };
+    let mut ours = vec![capability::TILE_RAW, capability::TILE_ZLIB];
+    if cfg!(feature = "h264") {
+        ours.push(capability::VIDEO_H264);
+    }
+    if sh.cfg.files_send || sh.cfg.files_receive {
+        ours.push(capability::FILE_TRANSFER);
+    }
     let caps: Vec<u32> = capabilities
         .iter()
         .copied()
@@ -432,7 +452,7 @@ async fn handshake(
         reason: String::new(),
     })
     .await?;
-    Ok(caps)
+    Ok((caps, method == auth_method::NONE))
 }
 
 async fn session(
@@ -442,9 +462,27 @@ async fn session(
     ctrl: &mpsc::Sender<Message>,
     gfx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
-    let caps = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(sh, peer, &mut inbox, ctrl))
-        .await
-        .map_err(|_| anyhow::anyhow!("timeout no handshake"))??;
+    let (caps, no_auth) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(sh, peer, &mut inbox, ctrl))
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout no handshake"))??;
+    // sem credencial, so com autorizacao local (allow_attended)
+    let ask = sh.cfg.ask_before_accept || (no_auth && !sh.cfg.allow_no_auth);
+    if ask && !crate::tray::ask_accept(peer).await {
+        sh.audit
+            .record("rejected", &[("peer", peer), ("reason", "local_user")]);
+        close(ctrl, close_code::AUTH_FAILED, "recusado pelo usuario local").await;
+        bail!("recusado pelo usuario local");
+    }
+    let files_ok = caps.contains(&capability::FILE_TRANSFER);
+    let mut inbound = (files_ok && sh.cfg.files_receive).then(|| {
+        openvnc_client::files::Inbound::new(
+            sh.cfg.files_dir(),
+            sh.cfg.files_max_mb.saturating_mul(1024 * 1024),
+        )
+    });
+    let mut outbound = crate::files::Outbound::default();
+    let mut offers = (files_ok && sh.cfg.files_send).then(crate::files::subscribe);
     let zlib = caps.contains(&capability::TILE_ZLIB);
     let mut video = Video::new(caps.contains(&capability::VIDEO_H264));
     let mut frames = sh.frames.clone();
@@ -503,11 +541,52 @@ async fn session(
                 Some(Message::Ping { nonce }) => ctrl.send(Message::Pong { nonce }).await?,
                 Some(Message::Pong { .. }) => {}
                 Some(Message::Close { .. }) => return Ok(()),
+                Some(Message::FileOffer { id, name, size }) => {
+                    let r = match &mut inbound {
+                        Some(i) => i.offer(id, &name, size),
+                        None => Err("recebimento de arquivos desabilitado".into()),
+                    };
+                    match &r {
+                        Ok(dest) => tracing::info!(%peer, "recebendo {name} ({size} bytes) em {}", dest.display()),
+                        Err(e) => tracing::info!(%peer, "recusado {name}: {e}"),
+                    }
+                    ctrl.send(Message::FileAccept { id, accept: r.is_ok() }).await?;
+                }
+                Some(Message::FileChunk { id, offset, data }) => {
+                    let Some(i) = &mut inbound else { bail!("FILE_CHUNK sem transferencia") };
+                    if let Err(e) = i.chunk(id, offset, &data) {
+                        tracing::warn!(%peer, "arquivo {id} descartado: {e}");
+                    }
+                }
+                Some(Message::FileEnd { id, sha256 }) => {
+                    let Some(i) = &mut inbound else { bail!("FILE_END sem transferencia") };
+                    match i.end(id, &sha256) {
+                        Ok(f) => {
+                            let path = f.path.display().to_string();
+                            tracing::info!(%peer, "arquivo recebido: {path}");
+                            sh.audit.record("file_received", &[("peer", peer), ("path", &path), ("size", &f.size.to_string())]);
+                        }
+                        Err(e) => tracing::warn!(%peer, "arquivo {id} descartado: {e}"),
+                    }
+                }
+                Some(Message::FileAccept { id, accept }) => outbound.answer(id, accept, ctrl.clone()),
                 Some(other) => {
                     close(ctrl, close_code::PROTOCOL_ERROR, "mensagem inesperada").await;
                     bail!("mensagem inesperada: tipo {:#06x}", other.type_code());
                 }
             },
+            p = async { offers.as_mut().expect("guardado").recv().await }, if offers.is_some() => {
+                match p {
+                    Ok(path) => {
+                        if let Some(m) = outbound.offer(path.clone()) {
+                            sh.audit.record("file_offered", &[("peer", peer), ("path", &path.display().to_string())]);
+                            ctrl.send(m).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => offers = None,
+                }
+            }
             _ = tokio::time::sleep(REFINE_AFTER), if video.lossy && seq - acked < WINDOW => {
                 // movimento parou: reenvia a tela sem perdas
                 video.lossy = false;

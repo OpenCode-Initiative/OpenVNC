@@ -1,0 +1,22 @@
+[package]
+name = "openvnc-config"
+description = "Assistente e configuracoes do OpenVNC Server (Windows)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "openvnc-config"
+path = "src/main.rs"
+
+[dependencies]
+openvnc-security.workspace = true
+anyhow.workspace = true
+toml = "0.8"
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "glow", "default_fonts", "x11", "wayland"] }
+
+[lints]
+workspace = true

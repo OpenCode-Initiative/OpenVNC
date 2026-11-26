@@ -13,6 +13,7 @@ des.workspace = true
 zeroize.workspace = true
 sha2.workspace = true
 rand.workspace = true
+argon2 = { version = "0.5", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

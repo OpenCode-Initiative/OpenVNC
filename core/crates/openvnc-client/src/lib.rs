@@ -19,6 +19,7 @@ use tokio::sync::mpsc as tmpsc;
 /// Versao do crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod files;
 pub mod native;
 
 /// Opcoes de conexao.
