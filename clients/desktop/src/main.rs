@@ -176,6 +176,13 @@ struct Remote {
     files_plan: Option<(String, NativeAuth)>,
     show_files: bool,
     send_path: String,
+    /// Nome exibido na aba (nome do desktop remoto, ou o endereco).
+    label: String,
+    /// Seguranca usada nesta conexao (para abrir a conexao de arquivos).
+    security: Security,
+    tls_arg: String,
+    /// Conectou informando senha/token (para explicar recusas).
+    had_password: bool,
 }
 
 struct App {
@@ -185,7 +192,10 @@ struct App {
     shared: bool,
     scale: Scale,
     error: Option<String>,
-    remote: Option<Remote>,
+    /// Conexoes abertas, uma por aba.
+    tabs: Vec<Remote>,
+    /// Aba ativa; None = tela de nova conexao.
+    active: Option<usize>,
     security: Security,
     /// Impressao (Pin) ou caminho do PEM (Ca).
     tls_arg: String,
@@ -246,7 +256,8 @@ impl App {
             shared: true,
             scale: Scale::Fit,
             error: None,
-            remote: None,
+            tabs: Vec::new(),
+            active: None,
             security: Security::Tofu,
             tls_arg: String::new(),
             user: String::new(),
@@ -336,16 +347,21 @@ impl App {
             }
             _ => None,
         };
-        if !self.password.is_empty() {
+        let had_password = !self.password.is_empty();
+        if had_password {
             o.config.password = Some(Password::new(std::mem::take(&mut self.password)));
         }
         let c = ctx.clone();
         let session = Session::spawn(self.rt.handle(), o, Arc::new(move || c.request_repaint()));
         self.error = None;
-        self.remote = Some(Remote {
+        self.tabs.push(Remote {
             session,
             texture: None,
             generation: 0,
+            label: self.host.trim().to_string(),
+            security: self.security,
+            tls_arg: self.tls_arg.trim().to_string(),
+            had_password,
             title: addr,
             status: "conectando...".into(),
             legacy_auth: false,
@@ -361,6 +377,191 @@ impl App {
             show_files: false,
             send_path: String::new(),
         });
+        self.active = Some(self.tabs.len() - 1);
+    }
+
+    /// Remove a aba `i` e ajusta a aba ativa.
+    fn close_tab(&mut self, i: usize) {
+        self.tabs.remove(i);
+        self.active = match self.active {
+            _ if self.tabs.is_empty() => None,
+            Some(a) if a == i => Some(i.min(self.tabs.len() - 1)),
+            Some(a) if a > i => Some(a - 1),
+            a => a,
+        };
+    }
+
+    /// Processa os eventos de todas as conexoes (inclusive abas em segundo plano).
+    fn pump(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.tabs.len() {
+            let mut drop_tab = false;
+            let remote = &mut self.tabs[i];
+            while let Some(e) = remote.session.try_event() {
+                match e {
+                    SessionEvent::Connected {
+                        width,
+                        height,
+                        name,
+                        legacy_auth,
+                        encrypted,
+                        ..
+                    } => {
+                        remote.connected = true;
+                        if let Some((addr, auth)) = remote.files_plan.take() {
+                            match files_tls(remote.security, &remote.tls_arg, &remote.title) {
+                                Ok(tls) => {
+                                    remote.files = Some(transfer::FileLink::spawn(
+                                        self.rt.handle(),
+                                        addr,
+                                        tls,
+                                        auth,
+                                        ctx.clone(),
+                                    ));
+                                }
+                                Err(e) => tracing::warn!("arquivos: {e:#}"),
+                            }
+                        }
+                        remote.legacy_auth = legacy_auth;
+                        remote.encrypted = encrypted;
+                        if !name.trim().is_empty() {
+                            remote.label = name.clone();
+                        }
+                        remote.status = format!("{name} ({width}x{height})");
+                    }
+                    SessionEvent::Disconnected { reason, .. } if trust_issue(&reason).is_some() => {
+                        // falha de confianca nunca e repetida em silencio
+                        self.trust = trust_issue(&reason);
+                        drop_tab = true;
+                        break;
+                    }
+                    SessionEvent::Disconnected { reason, retrying } => {
+                        remote.connected = false;
+                        remote.status = if retrying {
+                            format!("conexao perdida ({reason}); reconectando...")
+                        } else {
+                            remote.ended = true;
+                            let r = reason.to_string();
+                            if r.contains("sub-tipo VeNCrypt") && !remote.had_password {
+                                "Este computador exige senha. Digite a senha de acesso \
+                                 remoto definida no servidor."
+                                    .to_string()
+                            } else {
+                                format!("desconectado: {r}")
+                            }
+                        };
+                    }
+                    SessionEvent::CutText(t) => ctx.copy_text(t),
+                    SessionEvent::Cursor {
+                        hot_x,
+                        hot_y,
+                        width,
+                        height,
+                        rgba,
+                    } => {
+                        remote.cursor = (width > 0 && height > 0).then(|| {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [usize::from(width), usize::from(height)],
+                                &rgba,
+                            );
+                            let tex =
+                                ctx.load_texture("cursor", img, egui::TextureOptions::NEAREST);
+                            (tex, egui::vec2(f32::from(hot_x), f32::from(hot_y)))
+                        });
+                    }
+                    SessionEvent::Resized { width, height } => {
+                        remote.status = format!("{width}x{height}");
+                    }
+                    SessionEvent::Bell | SessionEvent::Updated => {}
+                }
+            }
+            if !drop_tab && remote.ended && !remote.connected && remote.texture.is_none() {
+                // nunca chegou a mostrar a tela: volta ao formulario com o erro
+                self.error = Some(remote.status.clone());
+                drop_tab = true;
+            }
+            if drop_tab {
+                let was_active = self.active == Some(i);
+                self.close_tab(i);
+                if was_active {
+                    self.active = None;
+                }
+            } else {
+                sync_texture(ctx, &mut self.tabs[i]);
+                i += 1;
+            }
+        }
+    }
+
+    /// Barra de abas: uma por conexao, mais "+" para abrir outra.
+    fn tab_bar(&mut self, ctx: &egui::Context) {
+        let mut close = None;
+        egui::TopBottomPanel::top("tabs")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, t) in self.tabs.iter().enumerate() {
+                            let dot = if t.connected {
+                                egui::RichText::new("\u{25CF}")
+                                    .color(egui::Color32::from_rgb(80, 180, 80))
+                            } else {
+                                egui::RichText::new("\u{25CF}")
+                                    .color(egui::Color32::from_rgb(220, 160, 0))
+                            };
+                            let on = self.active == Some(i);
+                            egui::Frame::NONE
+                                .fill(if on {
+                                    ui.visuals().selection.bg_fill
+                                } else {
+                                    ui.visuals().widgets.inactive.weak_bg_fill
+                                })
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::symmetric(10, 4))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(dot);
+                                        let r = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&t.label).strong(),
+                                                )
+                                                .selectable(false)
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(format!("{}\n{}", t.title, t.status));
+                                        if r.clicked() {
+                                            self.active = Some(i);
+                                        }
+                                        if ui
+                                            .add(egui::Button::new("\u{2715}").frame(false))
+                                            .on_hover_text("Desconectar e fechar a aba")
+                                            .clicked()
+                                        {
+                                            close = Some(i);
+                                        }
+                                    });
+                                });
+                        }
+                        let plus = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("+").size(20.0).strong())
+                                    .selected(self.active.is_none())
+                                    .min_size(egui::vec2(36.0, 30.0)),
+                            )
+                            .on_hover_text("Nova conexao (Ctrl+T)");
+                        if plus.clicked() {
+                            self.active = None;
+                        }
+                    });
+                });
+            });
+        if let Some(i) = close {
+            self.close_tab(i);
+        }
     }
 
     /// Dialogos de confianca TLS. Retorna true se um dialogo esta aberto.
@@ -577,89 +778,33 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (security, tls_arg) = (self.security, self.tls_arg.trim().to_string());
-        let Some(remote) = self.remote.as_mut() else {
+        self.pump(ctx);
+        // Ctrl+T: nova conexao; Ctrl+Tab: proxima aba
+        let (new_tab, next_tab) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl && i.key_pressed(egui::Key::T),
+                i.modifiers.ctrl && i.key_pressed(egui::Key::Tab),
+            )
+        });
+        if new_tab {
+            self.active = None;
+        }
+        if next_tab && !self.tabs.is_empty() {
+            self.active = Some(self.active.map_or(0, |a| (a + 1) % self.tabs.len()));
+        }
+        if !self.tabs.is_empty() {
+            self.tab_bar(ctx);
+        }
+        let title = match self.active {
+            Some(i) => format!("OpenVNC - {}", self.tabs[i].label),
+            None => "OpenVNC".to_string(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        let Some(i) = self.active else {
             self.connect_screen(ctx);
             return;
         };
-        while let Some(e) = remote.session.try_event() {
-            match e {
-                SessionEvent::Connected {
-                    width,
-                    height,
-                    name,
-                    legacy_auth,
-                    encrypted,
-                    ..
-                } => {
-                    remote.connected = true;
-                    if let Some((addr, auth)) = remote.files_plan.take() {
-                        match files_tls(security, &tls_arg, &remote.title) {
-                            Ok(tls) => {
-                                remote.files = Some(transfer::FileLink::spawn(
-                                    self.rt.handle(),
-                                    addr,
-                                    tls,
-                                    auth,
-                                    ctx.clone(),
-                                ));
-                            }
-                            Err(e) => tracing::warn!("arquivos: {e:#}"),
-                        }
-                    }
-                    remote.legacy_auth = legacy_auth;
-                    remote.encrypted = encrypted;
-                    remote.status = format!("{name} — {width}x{height}");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                        "OpenVNC — {name}"
-                    )));
-                }
-                SessionEvent::Disconnected { reason, .. } if trust_issue(&reason).is_some() => {
-                    // falha de confianca nunca e repetida em silencio
-                    self.trust = trust_issue(&reason);
-                    self.remote = None;
-                    self.connect_screen(ctx);
-                    return;
-                }
-                SessionEvent::Disconnected { reason, retrying } => {
-                    remote.connected = false;
-                    remote.status = if retrying {
-                        format!("conexao perdida ({reason}); reconectando...")
-                    } else {
-                        remote.ended = true;
-                        format!("desconectado: {reason}")
-                    };
-                }
-                SessionEvent::CutText(t) => ctx.copy_text(t),
-                SessionEvent::Cursor {
-                    hot_x,
-                    hot_y,
-                    width,
-                    height,
-                    rgba,
-                } => {
-                    remote.cursor = (width > 0 && height > 0).then(|| {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [usize::from(width), usize::from(height)],
-                            &rgba,
-                        );
-                        let tex = ctx.load_texture("cursor", img, egui::TextureOptions::NEAREST);
-                        (tex, egui::vec2(f32::from(hot_x), f32::from(hot_y)))
-                    });
-                }
-                SessionEvent::Resized { width, height } => {
-                    remote.status = format!("{width}x{height}");
-                }
-                SessionEvent::Bell | SessionEvent::Updated => {}
-            }
-        }
-        if remote.ended && !remote.connected && remote.texture.is_none() {
-            self.error = Some(remote.status.clone());
-            self.remote = None;
-            self.connect_screen(ctx);
-            return;
-        }
-        sync_texture(ctx, remote);
+        let remote = &mut self.tabs[i];
 
         let mut disconnect = false;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
@@ -755,7 +900,7 @@ impl eframe::App for App {
                 }
             });
         if disconnect {
-            self.remote = None;
+            self.close_tab(i);
         }
     }
 }

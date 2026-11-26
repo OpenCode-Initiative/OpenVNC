@@ -297,7 +297,7 @@ impl App {
             control: !get_bool(&table, "view_only", false),
             tls: get_bool(&table, "require_tls", true),
             lan_only: get_bool(&table, "lan_only", true),
-            ask: get_bool(&table, "allow_attended", false),
+            ask: get_bool(&table, "allow_attended", true),
             autostart,
             f_recv: get_bool(&table, "files_receive", true),
             f_send: get_bool(&table, "files_send", true),
@@ -335,8 +335,8 @@ impl App {
                 if self.pw != self.pw2 {
                     return Err("as senhas nao conferem".into());
                 }
-                if passhash::strength(&self.pw) < 2 {
-                    return Err("senha fraca: use 12 caracteres ou mais, com variedade".into());
+                if self.pw.chars().count() < 5 {
+                    return Err("senha curta demais: use pelo menos 5 caracteres".into());
                 }
                 Ok(())
             }
@@ -506,6 +506,13 @@ fn strength_bar(ui: &mut egui::Ui, pw: &str) {
             .fill(color)
             .text(format!("forca: {txt}")),
     );
+    if s < 2 {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 120, 50),
+            "Altamente NAO recomendado: senhas curtas ou simples podem ser adivinhadas. \
+             Prefira 12 caracteres ou mais, misturando letras, numeros e simbolos.",
+        );
+    }
 }
 
 fn secret(ui: &mut egui::Ui, v: &mut String, show: bool, hint: &str) -> egui::Response {
@@ -1174,9 +1181,13 @@ mod tests {
     fn validacao_das_etapas() {
         let mut a = app("");
         assert!(a.check(Page::Password).is_err());
+        a.pw = "abcd".into();
+        a.pw2 = "abcd".into();
+        assert!(a.check(Page::Password).is_err());
+        // 5+ caracteres: permitido, apenas desaconselhado
         a.pw = "curta".into();
         a.pw2 = "curta".into();
-        assert!(a.check(Page::Password).is_err());
+        assert!(a.check(Page::Password).is_ok());
         a.pw = passhash::generate();
         a.pw2 = a.pw.clone();
         assert!(a.check(Page::Password).is_ok());
