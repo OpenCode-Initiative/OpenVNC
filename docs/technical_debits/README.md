@@ -30,7 +30,7 @@ Componentes: `servidor`, `plataforma` (captura e entrada por SO), `cliente` (des
 
 | ID | Titulo | Componente | Tipo | Prioridade | Status | Fase-alvo |
 |---|---|---|---|---|---|---|
-| [TD-001](ci/TD-001-jobs-interop-nunca-rodaram-no-github.md) | Jobs de interop nunca rodaram no GitHub Actions | ci | lacuna-de-teste | P0 | aberto | v0.3 |
+| [TD-001](ci/TD-001-jobs-interop-nunca-rodaram-no-github.md) | Jobs de interop nunca rodaram no GitHub Actions | ci | lacuna-de-teste | P0 | resolvido | v0.3 |
 | [TD-002](plataforma/TD-002-macos-screencapturekit.md) | macOS usa CGDisplayCreateImage obsoleto e nunca rodou num Mac | plataforma | divida-tecnica | P1 | em-andamento | v0.4 |
 | [TD-003](plataforma/TD-003-wayland-portal-quadros-reais.md) | Wayland: portal com quadros reais e entrada RemoteDesktop nao testados | plataforma | lacuna-de-teste | P1 | aberto | v0.4 |
 | [TD-006](cliente/TD-006-desktop-ui-tls.md) | Cliente desktop sem UI para TLS (pin, TOFU, usuario/dispositivo) | cliente | funcionalidade-pendente | P1 | resolvido | v0.4 |

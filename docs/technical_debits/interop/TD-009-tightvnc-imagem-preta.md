@@ -34,3 +34,4 @@ Resultado inconclusivo na matriz de interoperabilidade para um servidor alvo da 
 ## Historico
 - 2026-11-26: registrado a partir da analise das fases 0 a 3.
 - 2026-11-26: reavaliado. **Impossivel nesta sessao:** o TightVNC 2.x nao esta instalado nesta maquina, e instala-lo cria um servico do Windows que exporia a tela real. Isso exige autorizacao do usuario, que nao foi dada. A reproducao continua pendente (P3, v1.0).
+- 2026-11-26: tentativa de reproducao com o openvnc-server nesta maquina (um unico monitor, 2560x1440, sessao interativa). DXGI e GDI (`OPENVNC_CAPTURE=gdi`) entregam a tela correta, tanto pelo CLI quanto por um cliente RFB minimo pedindo so Raw ou so Hextile (3649 de 3697 amostras nao pretas). Nao reproduz. O relato original (4480x1440, loopback recusado) aponta para dois monitores e para um servidor que recusa loopback, o que o openvnc-server nao faz; o TightVNC faz por padrao. Para reproduzir falta a configuracao com dois monitores.
