@@ -14,7 +14,7 @@ use openvnc_core::{Error, Rect, Result};
 use openvnc_framebuffer::{Framebuffer, DEFAULT_MAX_BYTES};
 use openvnc_protocol::io::{read_message, write_message};
 use openvnc_protocol::{
-    auth_method, capability, encoding, FrameRect, Input, Message, DEFAULT_MAX_PAYLOAD,
+    auth_method, capability, close_code, encoding, FrameRect, Input, Message, DEFAULT_MAX_PAYLOAD,
     PROTOCOL_VERSION,
 };
 use openvnc_transport::tls::{host_of, ClientTls};
@@ -42,6 +42,15 @@ pub enum NativeAuth {
     None,
     /// Senha.
     Password(String),
+    /// Conta da empresa (o servidor confere com `auth_command`: LDAP, SSO...).
+    User {
+        /// Usuario.
+        user: String,
+        /// Senha.
+        password: String,
+    },
+    /// SSO: ID token obtido com [`NativeClient::oidc_login`].
+    OidcToken(String),
     /// Dispositivo pareado: id e token.
     Device {
         /// Id (`dev-...`).
@@ -57,7 +66,9 @@ impl std::fmt::Debug for NativeAuth {
         match self {
             NativeAuth::None => f.write_str("None"),
             NativeAuth::Password(_) => f.write_str("Password(***)"),
+            NativeAuth::User { user, .. } => write!(f, "User({user}, ***)"),
             NativeAuth::Device { id, .. } => write!(f, "Device({id})"),
+            NativeAuth::OidcToken(_) => f.write_str("OidcToken(***)"),
         }
     }
 }
@@ -83,6 +94,50 @@ enum Chan {
     Control,
     Input,
     Graphics,
+}
+
+/// Envia entrada e clipboard para uma [`NativeClient`].
+#[derive(Clone)]
+pub struct NativeSender(mpsc::UnboundedSender<(Chan, Message)>);
+
+impl NativeSender {
+    /// Evento de entrada.
+    pub fn input(&self, ev: Input) -> Result<()> {
+        self.0
+            .send((Chan::Input, Message::InputEvent(ev)))
+            .map_err(|_| perr("conexao encerrada"))
+    }
+
+    /// Clipboard local para o servidor.
+    pub fn clipboard(&self, text: String) -> Result<()> {
+        self.0
+            .send((Chan::Control, Message::Clipboard { text }))
+            .map_err(|_| perr("conexao encerrada"))
+    }
+
+    /// Pedido ao explorador de arquivos; a resposta chega como
+    /// [`NativeEvent::FsResponse`] com o mesmo `id`.
+    pub fn fs(&self, id: u32, op: openvnc_protocol::FsOp) -> Result<()> {
+        self.0
+            .send((Chan::Control, Message::FsRequest { id, op }))
+            .map_err(|_| perr("conexao encerrada"))
+    }
+
+    /// Liga ou desliga o bloqueio de mouse e teclado do computador remoto.
+    /// Com o bloqueio ligado, mande [`Self::ping`] a cada poucos segundos:
+    /// o servidor solta o bloqueio apos 10 s sem trafego.
+    pub fn input_lock(&self, on: bool) -> Result<()> {
+        self.0
+            .send((Chan::Control, Message::InputLock { on }))
+            .map_err(|_| perr("conexao encerrada"))
+    }
+
+    /// Sinal de vida (PING).
+    pub fn ping(&self, nonce: u64) -> Result<()> {
+        self.0
+            .send((Chan::Control, Message::Ping { nonce }))
+            .map_err(|_| perr("conexao encerrada"))
+    }
 }
 
 /// Sessao nativa estabelecida e autenticada.
@@ -194,6 +249,20 @@ pub enum NativeEvent {
         /// Motivo.
         reason: String,
     },
+    /// Resposta do explorador de arquivos (ver [`NativeSender::fs`]).
+    FsResponse {
+        /// Id do pedido.
+        id: u32,
+        /// Resultado.
+        reply: openvnc_protocol::FsReply,
+    },
+    /// Estado do bloqueio de mouse e teclado do computador remoto.
+    InputLockState {
+        /// Bloqueado?
+        on: bool,
+        /// Motivo (vazio quando tudo certo).
+        reason: String,
+    },
 }
 
 fn perr(s: impl Into<String>) -> Error {
@@ -290,20 +359,108 @@ async fn link_tcp(o: &NativeOptions) -> Result<Link> {
     Ok((in_rx, out, None))
 }
 
+/// Configuracao de SSO anunciada pelo servidor.
+#[derive(Debug, Clone)]
+pub struct OidcInfo {
+    /// Emissor.
+    pub issuer: String,
+    /// Client id.
+    pub client_id: String,
+    /// Escopos.
+    pub scope: String,
+}
+
+async fn open_link(o: &NativeOptions) -> Result<(Link, &'static str)> {
+    Ok(match o.transport {
+        NativeTransport::Quic => (link_quic(o).await?, "quic"),
+        NativeTransport::Tcp => (link_tcp(o).await?, "tcp-tls"),
+        NativeTransport::Auto => match link_quic(o).await {
+            Ok(l) => (l, "quic"),
+            Err(e) => {
+                tracing::info!("QUIC indisponivel ({e}); tentando TCP+TLS");
+                (link_tcp(o).await?, "tcp-tls")
+            }
+        },
+    })
+}
+
 impl NativeClient {
+    /// Pergunta ao servidor como fazer SSO (abre e fecha uma conexao).
+    pub async fn oidc_info(o: &NativeOptions) -> Result<OidcInfo> {
+        let ((mut inbox, out, _quic), _) = open_link(o).await?;
+        let send = |m: Message| {
+            out.send((Chan::Control, m))
+                .map_err(|_| perr("conexao encerrada"))
+        };
+        send(Message::ClientHello {
+            min_version: PROTOCOL_VERSION,
+            max_version: PROTOCOL_VERSION,
+            capabilities: vec![capability::AUTH_OIDC],
+            name: format!("openvnc-client {}", crate::VERSION),
+        })?;
+        let mut info = None;
+        for _ in 0..2 {
+            match next(&mut inbox, o.timeout).await? {
+                Some(Message::ServerHello { auth_methods, .. })
+                    if !auth_methods.contains(&auth_method::OIDC) =>
+                {
+                    break;
+                }
+                Some(Message::ServerHello { .. }) => {}
+                Some(Message::OidcConfig {
+                    issuer,
+                    client_id,
+                    scope,
+                }) => {
+                    info = Some(OidcInfo {
+                        issuer,
+                        client_id,
+                        scope,
+                    });
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let _ = send(Message::Close {
+            code: close_code::NORMAL,
+            reason: String::new(),
+        });
+        info.ok_or_else(|| perr("o servidor nao oferece SSO"))
+    }
+
+    /// SSO completo: descobre o provedor pelo servidor e faz o login por
+    /// codigo de dispositivo. `show` exibe o codigo ao usuario. Devolve
+    /// opcoes com [`NativeAuth::OidcToken`] prontas para [`Self::connect`].
+    pub async fn oidc_login(
+        o: &NativeOptions,
+        show: impl FnMut(&openvnc_security::oidc::DeviceCode) + Send + 'static,
+        cancel: impl Fn() -> bool + Send + 'static,
+        ca_pem: Option<Vec<u8>>,
+    ) -> Result<NativeOptions> {
+        let info = Self::oidc_info(o).await?;
+        let mut show = show;
+        let token = tokio::task::spawn_blocking(move || {
+            openvnc_security::oidc::device_login(
+                &info.issuer,
+                &info.client_id,
+                &info.scope,
+                ca_pem.as_deref(),
+                &mut show,
+                &cancel,
+            )
+        })
+        .await
+        .map_err(|e| perr(e.to_string()))?
+        .map_err(|e| perr(format!("SSO: {e}")))?;
+        let mut o = o.clone();
+        o.auth = NativeAuth::OidcToken(token);
+        Ok(o)
+    }
+
     /// Conecta, autentica e espera o DISPLAY_INFO.
     pub async fn connect(o: &NativeOptions) -> Result<Self> {
-        let (link, transport) = match o.transport {
-            NativeTransport::Quic => (link_quic(o).await?, "quic"),
-            NativeTransport::Tcp => (link_tcp(o).await?, "tcp-tls"),
-            NativeTransport::Auto => match link_quic(o).await {
-                Ok(l) => (l, "quic"),
-                Err(e) => {
-                    tracing::info!("QUIC indisponivel ({e}); tentando TCP+TLS");
-                    (link_tcp(o).await?, "tcp-tls")
-                }
-            },
-        };
+        let (link, transport) = open_link(o).await?;
         let (mut inbox, out, quic) = link;
         let send = |m: Message| {
             out.send((Chan::Control, m))
@@ -318,12 +475,16 @@ impl NativeClient {
                     capability::TILE_ZLIB,
                     capability::VIDEO_H264,
                     capability::FILE_TRANSFER,
+                    capability::FS_EXPLORER,
+                    capability::INPUT_LOCK,
                 ]
             } else {
                 vec![
                     capability::TILE_RAW,
                     capability::TILE_ZLIB,
                     capability::FILE_TRANSFER,
+                    capability::FS_EXPLORER,
+                    capability::INPUT_LOCK,
                 ]
             },
             name: format!("openvnc-client {}", crate::VERSION),
@@ -347,9 +508,15 @@ impl NativeClient {
             NativeAuth::Password(p) => {
                 (auth_method::PASSWORD, String::new(), p.as_bytes().to_vec())
             }
+            NativeAuth::User { user, password } => (
+                auth_method::PASSWORD,
+                user.clone(),
+                password.as_bytes().to_vec(),
+            ),
             NativeAuth::Device { id, token } => {
                 (auth_method::DEVICE, id.clone(), token.as_bytes().to_vec())
             }
+            NativeAuth::OidcToken(t) => (auth_method::OIDC, String::new(), t.as_bytes().to_vec()),
         };
         if !auth_methods.contains(&method) {
             return Err(perr(format!(
@@ -482,6 +649,12 @@ impl NativeClient {
                     return Ok(NativeEvent::Resized(width, height));
                 }
                 Message::Clipboard { text } => return Ok(NativeEvent::Clipboard(text)),
+                Message::FsResponse { id, reply } => {
+                    return Ok(NativeEvent::FsResponse { id, reply })
+                }
+                Message::InputLockState { on, reason } => {
+                    return Ok(NativeEvent::InputLockState { on, reason })
+                }
                 Message::Ping { nonce } => self.send(Chan::Control, Message::Pong { nonce })?,
                 Message::Close { code, reason } => {
                     return Err(perr(format!("servidor fechou ({code}): {reason}")))
@@ -612,6 +785,12 @@ impl NativeClient {
                 Err(reason) => NativeEvent::FileFailed { id, reason },
             });
         });
+    }
+
+    /// Canal de envio independente do `&mut self` de [`Self::next_event`]
+    /// (para mandar entrada e clipboard enquanto espera quadros).
+    pub fn sender(&self) -> NativeSender {
+        NativeSender(self.out.clone())
     }
 
     /// Envia um evento de entrada.

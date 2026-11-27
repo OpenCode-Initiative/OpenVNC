@@ -19,6 +19,16 @@ fn samples() -> Vec<Message> {
             user: "dev".into(),
             secret: vec![1, 2, 3],
         },
+        Message::OidcConfig {
+            issuer: "https://idp.empresa.local/realms/ti".into(),
+            client_id: "openvnc".into(),
+            scope: "openid profile".into(),
+        },
+        Message::AuthRequest {
+            method: 3,
+            user: String::new(),
+            secret: vec![b'a'; 20_000],
+        },
         Message::AuthResult {
             ok: false,
             reason: "nao".into(),
@@ -146,4 +156,132 @@ fn negociacao() {
     assert_eq!(negotiate_capabilities(&[1, 2, 3], &[3, 1]), vec![1, 3]);
     assert_eq!(negotiate_version(0, 2), Some(0));
     assert_eq!(negotiate_version(1, 2), None);
+}
+
+// ------------------------------------------- explorador e bloqueio de entrada
+
+fn fs_samples() -> Vec<Message> {
+    let ops = vec![
+        FsOp::Roots,
+        FsOp::List {
+            path: r"C:\Users".into(),
+        },
+        FsOp::Mkdir {
+            path: "/tmp/nova".into(),
+        },
+        FsOp::Rename {
+            from: "/a".into(),
+            to: "/b".into(),
+        },
+        FsOp::Delete { path: "/x".into() },
+        FsOp::Read {
+            path: "/f".into(),
+            offset: 7,
+            len: 65536,
+        },
+        FsOp::Write {
+            path: "/f".into(),
+            offset: 0,
+            overwrite: true,
+            data: vec![1, 2, 3],
+        },
+    ];
+    let replies = vec![
+        FsReply::Ok,
+        FsReply::Error {
+            message: "negado".into(),
+        },
+        FsReply::Roots {
+            roots: vec!["C:\\".into(), "D:\\".into()],
+        },
+        FsReply::Entries {
+            path: "/home".into(),
+            entries: vec![
+                FsEntry {
+                    name: "a.txt".into(),
+                    is_dir: false,
+                    size: 10,
+                    modified: 1_700_000_000,
+                },
+                FsEntry {
+                    name: "pasta".into(),
+                    is_dir: true,
+                    size: 0,
+                    modified: 0,
+                },
+            ],
+        },
+        FsReply::Data {
+            data: vec![9; 100],
+            eof: true,
+        },
+    ];
+    let mut v: Vec<Message> = ops
+        .into_iter()
+        .enumerate()
+        .map(|(i, op)| Message::FsRequest { id: i as u32, op })
+        .collect();
+    v.extend(
+        replies
+            .into_iter()
+            .enumerate()
+            .map(|(i, reply)| Message::FsResponse { id: i as u32, reply }),
+    );
+    v.push(Message::InputLock { on: true });
+    v.push(Message::InputLock { on: false });
+    v.push(Message::InputLockState {
+        on: false,
+        reason: "nao suportado".into(),
+    });
+    v
+}
+
+#[test]
+fn fs_e_bloqueio_roundtrip() {
+    let mut d = Decoder::default();
+    for m in fs_samples() {
+        for b in encode(&m).unwrap() {
+            d.feed(&[b]);
+        }
+        assert_eq!(d.next_message().unwrap(), Some(m));
+    }
+    assert_eq!(d.next_message().unwrap(), None);
+}
+
+#[test]
+fn fs_invalidos() {
+    // operacao desconhecida
+    assert!(decode_payload(msg_type::FS_REQUEST, &[0, 0, 0, 1, 99]).is_err());
+    // bool invalido no bloqueio
+    assert!(decode_payload(msg_type::INPUT_LOCK, &[2]).is_err());
+    // nome de entrada com separador
+    let m = Message::FsResponse {
+        id: 1,
+        reply: FsReply::Entries {
+            path: "/".into(),
+            entries: vec![FsEntry {
+                name: "../x".into(),
+                is_dir: false,
+                size: 0,
+                modified: 0,
+            }],
+        },
+    };
+    let b = encode(&m).unwrap();
+    assert!(decode_payload(msg_type::FS_RESPONSE, &b[HEADER_LEN..]).is_err());
+    // bloco grande demais
+    let m = Message::FsRequest {
+        id: 1,
+        op: FsOp::Write {
+            path: "/f".into(),
+            offset: 0,
+            overwrite: false,
+            data: vec![0; MAX_FILE_CHUNK + 1],
+        },
+    };
+    assert!(encode(&m).is_err());
+    // contagem de entradas acima do limite e recusada antes de alocar
+    let mut p = vec![0, 0, 0, 1, 3, 0, 1, b'/'];
+    p.extend_from_slice(&(MAX_FS_ENTRIES as u32 + 1).to_be_bytes());
+    assert!(decode_payload(msg_type::FS_RESPONSE, &p).is_err());
 }

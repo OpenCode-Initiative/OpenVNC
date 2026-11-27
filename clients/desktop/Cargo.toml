@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 openvnc-client.workspace = true
+openvnc-protocol.workspace = true
+openvnc-security.workspace = true
 openvnc-core.workspace = true
 openvnc-rfb.workspace = true
 openvnc-transport.workspace = true
@@ -28,3 +30,6 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "glow
 [lints]
 workspace = true
 
+
+[build-dependencies]
+embed-resource = "3"

@@ -47,6 +47,19 @@ fn tooltip() -> String {
     format!("OpenVNC Server ({name}), porta {port}: {c}")
 }
 
+/// Texto de quem pede acesso: `usuario de ip:porta`, ou so o peer quando
+/// nao ha usuario nomeado (senha unica ou dispositivo sem nome).
+pub fn who_label(user: &str, peer: &str) -> String {
+    let u = user.trim();
+    if u.is_empty() || u == crate::config::REMOTE_USER {
+        peer.to_string()
+    } else {
+        // limita e remove controles (texto vem do cliente)
+        let u: String = u.chars().filter(|c| !c.is_control()).take(64).collect();
+        format!("{u} de {peer}")
+    }
+}
+
 /// Pergunta ao usuario local se aceita a conexao de `peer`. Nega se ninguem
 /// responder em 30 s ou se nao houver como perguntar.
 pub async fn ask_accept(peer: &str) -> bool {
@@ -129,6 +142,12 @@ mod imp {
                     mask[y * N / 8 + x / 8] |= 0x80 >> (x % 8);
                 }
             }
+        }
+        // icone embutido no .exe (recurso 1, ver build.rs)
+        let res = unsafe { LoadIconW(GetModuleHandleW(null()), 1 as _) };
+        if !res.is_null() {
+            ICON.store(res as usize, Ordering::Relaxed);
+            return res;
         }
         let h = unsafe {
             CreateIcon(
@@ -310,7 +329,9 @@ mod imp {
                     unsafe {
                         let wnd = FindWindowW(null(), cap_w.as_ptr());
                         if !wnd.is_null() {
-                            PostMessageW(wnd, WM_CLOSE, 0, 0);
+                            // MB_YESNO nao tem Cancelar e ignora WM_CLOSE:
+                            // responde "Nao" pelo proprio botao
+                            PostMessageW(wnd, WM_COMMAND, IDNO as WPARAM, 0);
                         }
                     }
                 }
@@ -384,12 +405,103 @@ mod imp {
 mod imp {
     use std::time::Duration;
 
-    pub fn ask(_peer: &str, _timeout: Duration) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    /// Pergunta a quem esta na maquina (macOS: osascript; Linux: zenity ou
+    /// kdialog). Sem dialogo disponivel, sem resposta ou no tempo limite,
+    /// recusa.
+    pub fn ask(peer: &str, timeout: Duration) -> bool {
+        // texto vem da rede (usuario e endereco): so letras/digitos ASCII e
+        // `.:[]@_- `; nada de aspas, barra invertida ou `$` (vai para o
+        // osascript/zenity)
+        let peer: String = peer
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || ".:[]@_- ".contains(*c))
+            .take(128)
+            .collect();
+        let msg = format!("{peer} quer acessar este computador pelo OpenVNC. Permitir?");
+        let secs = timeout.as_secs().max(1);
+        let tries: Vec<Vec<String>> = if cfg!(target_os = "macos") {
+            vec![vec![
+                "osascript".into(),
+                "-e".into(),
+                format!(
+                    "display dialog \"{msg}\" with title \"OpenVNC\" buttons {{\"Recusar\", \"Permitir\"}} default button \"Recusar\" giving up after {secs}"
+                ),
+            ]]
+        } else {
+            vec![
+                vec![
+                    "zenity".into(),
+                    "--question".into(),
+                    "--title=OpenVNC".into(),
+                    format!("--text={msg}"),
+                    format!("--timeout={secs}"),
+                ],
+                vec![
+                    "kdialog".into(),
+                    "--title".into(),
+                    "OpenVNC".into(),
+                    "--yesno".into(),
+                    msg.clone(),
+                ],
+            ]
+        };
+        for t in tries {
+            let Ok(mut c) = Command::new(&t[0])
+                .args(&t[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            let start = Instant::now();
+            loop {
+                match c.try_wait() {
+                    Ok(Some(st)) => {
+                        if !st.success() {
+                            return false;
+                        }
+                        let mut out = String::new();
+                        if let Some(mut o) = c.stdout.take() {
+                            let _ = std::io::Read::read_to_string(&mut o, &mut out);
+                        }
+                        // osascript imprime o botao; zenity/kdialog: codigo 0 = sim
+                        return !cfg!(target_os = "macos")
+                            || (out.contains("Permitir") && !out.contains("gave up:true"));
+                    }
+                    Ok(None) if start.elapsed() > timeout + Duration::from_secs(2) => {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                        return false;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    Err(_) => return false,
+                }
+            }
+        }
         false
     }
 
     pub fn run() -> Result<(), String> {
         let _ = super::tooltip;
         Err("so no Windows".into())
+    }
+}
+
+#[cfg(test)]
+mod who_tests {
+    use super::who_label;
+
+    #[test]
+    fn mostra_usuario_e_origem() {
+        assert_eq!(who_label("joao.silva", "10.1.2.3:5"), "joao.silva de 10.1.2.3:5");
+        assert_eq!(who_label("  ", "10.1.2.3:5"), "10.1.2.3:5");
+        assert_eq!(who_label(crate::config::REMOTE_USER, "p"), "p");
+        assert_eq!(who_label("a\nb", "p"), "ab de p");
+        assert_eq!(who_label(&"x".repeat(200), "p").len(), 64 + " de p".len());
     }
 }

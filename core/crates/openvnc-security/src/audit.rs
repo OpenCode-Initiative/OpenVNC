@@ -15,6 +15,8 @@ use openvnc_core::Result;
 #[derive(Debug)]
 pub struct AuditLog {
     out: Mutex<Option<File>>,
+    /// Copia de cada linha para envio ao servidor central (sem bloquear).
+    forward: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
 }
 
 /// Escapa `s` como string JSON (sem as aspas).
@@ -49,6 +51,7 @@ impl AuditLog {
     pub fn disabled() -> Self {
         AuditLog {
             out: Mutex::new(None),
+            forward: Mutex::new(None),
         }
     }
 
@@ -68,7 +71,16 @@ impl AuditLog {
         }
         Ok(AuditLog {
             out: Mutex::new(Some(o.open(path)?)),
+            forward: Mutex::new(None),
         })
+    }
+
+    /// Passa a copiar cada linha (sem a quebra final) para `tx`. Se a fila estiver
+    /// cheia a copia e descartada: o log local continua sendo a fonte.
+    pub fn set_forward(&self, tx: std::sync::mpsc::SyncSender<String>) {
+        if let Ok(mut g) = self.forward.lock() {
+            *g = Some(tx);
+        }
     }
 
     /// Registra um evento. Falha de escrita vai para o `tracing` mas nao
@@ -79,6 +91,11 @@ impl AuditLog {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut line = format_line(ts, event, fields);
+        if let Ok(g) = self.forward.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.try_send(line.clone());
+            }
+        }
         line.push('\n');
         let Ok(mut g) = self.out.lock() else { return };
         if let Some(f) = g.as_mut() {

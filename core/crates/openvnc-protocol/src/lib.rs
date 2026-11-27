@@ -14,6 +14,9 @@
 
 pub mod io;
 
+mod fsops;
+pub use fsops::{FsEntry, FsOp, FsReply, MAX_FS_ENTRIES, MAX_FS_ROOTS};
+
 use openvnc_core::{check_limit, Error, Result};
 
 /// Versao do crate.
@@ -30,6 +33,10 @@ pub const DEFAULT_MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 /// Tamanho maximo de qualquer string do protocolo (bytes UTF-8).
 pub const MAX_STRING: usize = 4096;
+
+/// Tamanho maximo do segredo de autenticacao (ID tokens OIDC com grupos
+/// passam de 4 KiB).
+pub const MAX_SECRET: usize = 32 * 1024;
 
 /// Numero maximo de capabilities numa mensagem HELLO.
 pub const MAX_CAPABILITIES: usize = 64;
@@ -53,6 +60,7 @@ pub mod msg_type {
     pub const SERVER_HELLO: u16 = 0x0002;
     pub const AUTH_REQUEST: u16 = 0x0003;
     pub const AUTH_RESULT: u16 = 0x0004;
+    pub const OIDC_CONFIG: u16 = 0x0005;
     pub const DISPLAY_INFO: u16 = 0x0010;
     pub const FRAME_UPDATE: u16 = 0x0011;
     pub const FRAME_ACK: u16 = 0x0012;
@@ -63,6 +71,11 @@ pub mod msg_type {
     pub const FILE_ACCEPT: u16 = 0x0041;
     pub const FILE_CHUNK: u16 = 0x0042;
     pub const FILE_END: u16 = 0x0043;
+    // explorador de arquivos e bloqueio de entrada (modulo fsops)
+    pub const FS_REQUEST: u16 = 0x0050;
+    pub const FS_RESPONSE: u16 = 0x0051;
+    pub const INPUT_LOCK: u16 = 0x0060;
+    pub const INPUT_LOCK_STATE: u16 = 0x0061;
     pub const PING: u16 = 0x00F0;
     pub const PONG: u16 = 0x00F1;
     pub const CLOSE: u16 = 0x00FF;
@@ -81,10 +94,17 @@ pub mod capability {
     pub const CLIPBOARD_TEXT: u32 = 0x0020;
     /// Transferencia de arquivos basica.
     pub const FILE_TRANSFER: u32 = 0x0030;
+    /// Explorador de arquivos remoto (FS_REQUEST/FS_RESPONSE).
+    pub const FS_EXPLORER: u32 = 0x0031;
+    /// Bloqueio do mouse e teclado locais do servidor (INPUT_LOCK).
+    pub const INPUT_LOCK: u32 = 0x0040;
     /// Video H.264: retangulos `encoding::H264` de tela inteira, fluxo continuo.
     pub const VIDEO_H264: u32 = 0x0100;
     /// Video AV1 (reservado; ainda nao implementado).
     pub const VIDEO_AV1: u32 = 0x0101;
+    /// Login SSO por OIDC: o servidor manda [`super::Message::OidcConfig`]
+    /// logo depois do `ServerHello`.
+    pub const AUTH_OIDC: u32 = 0x0200;
 }
 
 /// Metodos de autenticacao.
@@ -96,6 +116,8 @@ pub mod auth_method {
     pub const PASSWORD: u8 = 1;
     /// Dispositivo pareado (id + token).
     pub const DEVICE: u8 = 2;
+    /// SSO: `secret` e o ID token (JWT) emitido pelo provedor OIDC.
+    pub const OIDC: u8 = 3;
 }
 
 /// Encodings de retangulo em FRAME_UPDATE.
@@ -192,6 +214,17 @@ pub enum Message {
         /// Segredo (senha ou token). Nunca registrar em log.
         secret: Vec<u8>,
     },
+    /// Dados do provedor OIDC para o cliente fazer o login por codigo de
+    /// dispositivo (RFC 8628). So enviado se `capability::AUTH_OIDC` foi
+    /// negociada.
+    OidcConfig {
+        /// Emissor (`iss`), base da descoberta `.well-known/openid-configuration`.
+        issuer: String,
+        /// Client id publico registrado no provedor.
+        client_id: String,
+        /// Escopos pedidos (separados por espaco).
+        scope: String,
+    },
     /// Resultado da autenticacao.
     AuthResult {
         /// Aceito.
@@ -272,6 +305,33 @@ pub enum Message {
         /// SHA-256.
         sha256: [u8; 32],
     },
+    /// Pedido ao explorador de arquivos.
+    FsRequest {
+        /// Id ecoado na resposta.
+        id: u32,
+        /// Operacao.
+        op: FsOp,
+    },
+    /// Resposta do explorador de arquivos.
+    FsResponse {
+        /// Id do pedido.
+        id: u32,
+        /// Resultado.
+        reply: FsReply,
+    },
+    /// Cliente pede para bloquear (ou liberar) o mouse e teclado fisicos
+    /// do computador remoto.
+    InputLock {
+        /// Ligar o bloqueio.
+        on: bool,
+    },
+    /// Estado do bloqueio informado pelo servidor.
+    InputLockState {
+        /// Bloqueio ativo.
+        on: bool,
+        /// Motivo (erro ou observacao); vazio se nada a dizer.
+        reason: String,
+    },
     /// Keepalive.
     Ping {
         /// Valor ecoado.
@@ -300,6 +360,7 @@ impl Message {
             Message::ServerHello { .. } => SERVER_HELLO,
             Message::AuthRequest { .. } => AUTH_REQUEST,
             Message::AuthResult { .. } => AUTH_RESULT,
+            Message::OidcConfig { .. } => OIDC_CONFIG,
             Message::DisplayInfo { .. } => DISPLAY_INFO,
             Message::FrameUpdate { .. } => FRAME_UPDATE,
             Message::FrameAck { .. } => FRAME_ACK,
@@ -310,6 +371,10 @@ impl Message {
             Message::FileAccept { .. } => FILE_ACCEPT,
             Message::FileChunk { .. } => FILE_CHUNK,
             Message::FileEnd { .. } => FILE_END,
+            Message::FsRequest { .. } => FS_REQUEST,
+            Message::FsResponse { .. } => FS_RESPONSE,
+            Message::InputLock { .. } => INPUT_LOCK,
+            Message::InputLockState { .. } => INPUT_LOCK_STATE,
             Message::Ping { .. } => PING,
             Message::Pong { .. } => PONG,
             Message::Close { .. } => CLOSE,
@@ -335,7 +400,10 @@ impl W {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
     fn bytes16(&mut self, b: &[u8]) -> Result<()> {
-        check_limit("string", b.len() as u64, MAX_STRING as u64)?;
+        self.bytes16_max(b, MAX_STRING)
+    }
+    fn bytes16_max(&mut self, b: &[u8], max: usize) -> Result<()> {
+        check_limit("string", b.len() as u64, max as u64)?;
         self.u16(b.len() as u16);
         self.0.extend_from_slice(b);
         Ok(())
@@ -401,11 +469,20 @@ fn encode_payload(m: &Message) -> Result<Vec<u8>> {
         } => {
             w.u8(*method);
             w.str(user)?;
-            w.bytes16(secret)?;
+            w.bytes16_max(secret, MAX_SECRET)?;
         }
         Message::AuthResult { ok, reason } => {
             w.u8(u8::from(*ok));
             w.str(reason)?;
+        }
+        Message::OidcConfig {
+            issuer,
+            client_id,
+            scope,
+        } => {
+            w.str(issuer)?;
+            w.str(client_id)?;
+            w.str(scope)?;
         }
         Message::DisplayInfo {
             width,
@@ -481,6 +558,19 @@ fn encode_payload(m: &Message) -> Result<Vec<u8>> {
             w.u32(*id);
             w.0.extend_from_slice(sha256);
         }
+        Message::FsRequest { id, op } => {
+            w.u32(*id);
+            fsops::encode_op(&mut w, op)?;
+        }
+        Message::FsResponse { id, reply } => {
+            w.u32(*id);
+            fsops::encode_reply(&mut w, reply)?;
+        }
+        Message::InputLock { on } => w.u8(u8::from(*on)),
+        Message::InputLockState { on, reason } => {
+            w.u8(u8::from(*on));
+            w.str(reason)?;
+        }
         Message::Ping { nonce } | Message::Pong { nonce } => w.u64(*nonce),
         Message::Close { code, reason } => {
             w.u16(*code);
@@ -552,8 +642,11 @@ impl<'a> R<'a> {
         }
     }
     fn bytes16(&mut self) -> Result<Vec<u8>> {
+        self.bytes16_max(MAX_STRING)
+    }
+    fn bytes16_max(&mut self, max: usize) -> Result<Vec<u8>> {
         let n = usize::from(self.u16()?);
-        check_limit("string", n as u64, MAX_STRING as u64)?;
+        check_limit("string", n as u64, max as u64)?;
         Ok(self.take(n)?.to_vec())
     }
     fn str(&mut self) -> Result<String> {
@@ -620,11 +713,16 @@ pub fn decode_payload(ty: u16, payload: &[u8]) -> Result<Message> {
         AUTH_REQUEST => Message::AuthRequest {
             method: r.u8()?,
             user: r.str()?,
-            secret: r.bytes16()?,
+            secret: r.bytes16_max(MAX_SECRET)?,
         },
         AUTH_RESULT => Message::AuthResult {
             ok: r.bool()?,
             reason: r.str()?,
+        },
+        OIDC_CONFIG => Message::OidcConfig {
+            issuer: r.str()?,
+            client_id: r.str()?,
+            scope: r.str()?,
         },
         DISPLAY_INFO => Message::DisplayInfo {
             width: r.u16()?,
@@ -718,6 +816,19 @@ pub fn decode_payload(ty: u16, payload: &[u8]) -> Result<Message> {
             sha256.copy_from_slice(r.take(32)?);
             Message::FileEnd { id, sha256 }
         }
+        FS_REQUEST => Message::FsRequest {
+            id: r.u32()?,
+            op: fsops::decode_op(&mut r)?,
+        },
+        FS_RESPONSE => Message::FsResponse {
+            id: r.u32()?,
+            reply: fsops::decode_reply(&mut r)?,
+        },
+        INPUT_LOCK => Message::InputLock { on: r.bool()? },
+        INPUT_LOCK_STATE => Message::InputLockState {
+            on: r.bool()?,
+            reason: r.str()?,
+        },
         PING => Message::Ping { nonce: r.u64()? },
         PONG => Message::Pong { nonce: r.u64()? },
         CLOSE => Message::Close {

@@ -34,6 +34,7 @@ git ls-files -z --cached --others --exclude-standard \
 echo "==> compilando e empacotando $DMG no Mac"
 "${SSH[@]}" "bash \"$MAC_SCRIPT\" \"$VER\""
 
+mkdir -p "$DEST"
 echo "==> baixando $DMG para $DEST"
 scp -i "$MAC_KEY" -o BatchMode=yes "$MAC_HOST:$MAC_OUT/$DMG" "$DEST/$DMG"
 ls -la "$DEST/$DMG"

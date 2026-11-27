@@ -20,3 +20,6 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "glow
 
 [lints]
 workspace = true
+
+[build-dependencies]
+embed-resource = "3"

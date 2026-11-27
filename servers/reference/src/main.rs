@@ -8,7 +8,11 @@
 mod config;
 mod diff;
 mod dpapi;
+mod extauth;
 mod files;
+mod fsexplorer;
+mod inputlock;
+mod lockout;
 mod native;
 mod tray;
 
@@ -127,6 +131,8 @@ struct Shared {
     tls: Option<TlsAcceptor>,
     devices: Option<DeviceStore>,
     audit: Arc<AuditLog>,
+    lockout: lockout::Lockout,
+    oidc: Option<openvnc_security::oidc::Verifier>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -292,6 +298,9 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         Some(p) => AuditLog::open(&p)?,
         None => AuditLog::disabled(),
     });
+    if let Err(e) = start_audit_forward(&cfg, &audit) {
+        tracing::warn!("encaminhamento da auditoria ao central desligado: {e}");
+    }
     audit.record(
         "server_start",
         &[
@@ -316,7 +325,31 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         }
         None => None,
     };
+    let oidc = match (&cfg.oidc_issuer, &cfg.oidc_client_id) {
+        (Some(issuer), Some(aud)) => {
+            let ca = match &cfg.oidc_ca {
+                Some(p) => Some(std::fs::read(p).with_context(|| format!("lendo {}", p.display()))?),
+                None => None,
+            };
+            let v = openvnc_security::oidc::Verifier::new(
+                openvnc_security::oidc::Policy {
+                    issuer: issuer.clone(),
+                    audience: aud.clone(),
+                    user_claim: cfg.oidc_user_claim.clone(),
+                    groups_claim: cfg.oidc_groups_claim.clone(),
+                    allowed_groups: cfg.oidc_allowed_groups.clone(),
+                    machine: cfg.central_machine_id.clone(),
+                },
+                ca.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("oidc: {e}"))?;
+            tracing::info!(%issuer, "SSO OIDC ligado");
+            Some(v)
+        }
+        _ => None,
+    };
     let shared = Arc::new(Shared {
+        oidc,
         cfg,
         password,
         frames,
@@ -325,6 +358,7 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         tls,
         devices,
         audit,
+        lockout: lockout::Lockout::default(),
     });
     if let Some(l) = native {
         tokio::spawn(native::serve(l, shared.clone()));
@@ -336,6 +370,14 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
             shared.audit.record(
                 "rejected",
                 &[("peer", &peer.to_string()), ("reason", "lan_only")],
+            );
+            continue;
+        }
+        if let Some(left) = shared.lockout.blocked(peer.ip(), Instant::now()) {
+            tracing::warn!(%peer, secs = left.as_secs(), "bloqueado por falhas de autenticacao");
+            shared.audit.record(
+                "rejected",
+                &[("peer", &peer.to_string()), ("reason", "lockout")],
             );
             continue;
         }
@@ -446,7 +488,10 @@ fn spawn_injector(mut inj: Box<dyn InputInjector>) -> mpsc::Sender<Input> {
         for ev in rx {
             let r = match ev {
                 Input::Key(k) => inj.key(k),
-                Input::Pointer(p) => inj.pointer(p),
+                Input::Pointer(p) => {
+                    tracing::trace!(x = p.x, y = p.y, buttons = p.buttons, "ponteiro");
+                    inj.pointer(p)
+                }
             };
             if let Err(e) = r {
                 tracing::warn!("injecao falhou: {e}");
@@ -507,13 +552,47 @@ fn plan(old: &Framebuffer, new: &Framebuffer, area: Rect) -> (Vec<(Rect, u16, u1
 fn verifier(
     st: Option<DeviceStore>,
     hash: Option<String>,
+    ext: Option<(Vec<String>, Duration)>,
     audit: Arc<AuditLog>,
     peer: String,
+    who: Arc<std::sync::Mutex<String>>,
 ) -> PlainVerifier {
     PlainVerifier(Arc::new(move |user: &str, token: &[u8]| {
+        // conta da empresa (LDAP/AD/SSO): nome que nao e dispositivo pareado
+        if let Some((cmd, t)) = &ext {
+            // arquivo ilegivel conta como dispositivo: falha fechada
+            let is_device = st.as_ref().is_some_and(|s| {
+                s.list()
+                    .map(|d| d.iter().any(|x| x.id == user))
+                    .unwrap_or(true)
+            });
+            if user != config::REMOTE_USER && !user.is_empty() && !is_device {
+                return match extauth::check(cmd, *t, user, &peer, token) {
+                    Ok(()) => {
+                        audit.record("user_auth", &[("peer", &peer), ("user", user)]);
+                        if let Ok(mut w) = who.lock() {
+                            *w = user.to_string();
+                        }
+                        true
+                    }
+                    Err(why) => {
+                        audit.record(
+                            "user_auth_failed",
+                            &[("peer", &peer), ("user", user), ("reason", &why)],
+                        );
+                        false
+                    }
+                };
+            }
+        }
         if user == config::REMOTE_USER || user.is_empty() {
             let ok = hash.as_deref().is_some_and(|h| passhash::verify(token, h));
-            if !ok {
+            if ok {
+                audit.record(
+                    "password_auth",
+                    &[("peer", &peer), ("user", config::REMOTE_USER)],
+                );
+            } else {
                 audit.record(
                     "password_auth_failed",
                     &[("peer", &peer), ("user", config::REMOTE_USER)],
@@ -523,7 +602,9 @@ fn verifier(
         }
         let Some(st) = &st else { return false };
         let v = st.verify(user, token);
-        if v != Verdict::Ok {
+        if v == Verdict::Ok {
+            audit.record("device_auth", &[("peer", &peer), ("device", user)]);
+        } else {
             audit.record(
                 "device_auth_failed",
                 &[("peer", &peer), ("device", user), ("reason", v.as_str())],
@@ -538,6 +619,8 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
     let mut sock: BoxStream = Box::new(sock);
     let mut frames = sh.frames.clone();
     let first = frames.borrow_and_update().clone();
+    // usuario da empresa autenticado (mostrado no pedido de aprovacao)
+    let who = Arc::new(std::sync::Mutex::new(String::new()));
     let mut srv = Server::new(
         ServerConfig {
             password: sh.password.clone().map(Password::new),
@@ -546,12 +629,19 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
             challenge: challenge()?,
             vencrypt: sh.tls.is_some(),
             require_tls: sh.cfg.require_tls,
-            plain: (sh.devices.is_some() || sh.cfg.password_hash.is_some()).then(|| {
+            plain: (sh.devices.is_some()
+                || sh.cfg.password_hash.is_some()
+                || sh.cfg.ext_auth().is_some())
+            .then(|| {
                 verifier(
                     sh.devices.clone(),
                     sh.cfg.password_hash.clone(),
+                    sh.cfg
+                        .ext_auth()
+                        .map(|c| (c.to_vec(), Duration::from_secs(sh.cfg.auth_timeout_secs))),
                     sh.audit.clone(),
                     peer.to_string(),
+                    who.clone(),
                 )
             }),
             ..Default::default()
@@ -585,11 +675,14 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
         while let Some(ev) = srv.poll_event() {
             match ev {
                 ServerEvent::AuthFailed => {
+                    // conta antes de responder: o cliente nao pode reconectar
+                    // antes de a falha valer
+                    sh.audit.record("auth_failed", &[("peer", peer)]);
+                    lock_fail(sh, peer);
                     let out = srv.take_output();
                     sock.write_all(&out).await?;
                     // entrega o motivo e fecha o TLS limpo (close_notify)
                     let _ = sock.shutdown().await;
-                    sh.audit.record("auth_failed", &[("peer", peer)]);
                     anyhow::bail!("autenticacao falhou");
                 }
                 ServerEvent::StartTls => {
@@ -611,12 +704,9 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                     sock.write_all(&out).await?;
                     sock.flush().await?;
                 }
-                ServerEvent::PlainLogin { username, accepted } => {
-                    if accepted {
-                        sh.audit
-                            .record("device_auth", &[("peer", peer), ("device", &username)]);
-                    }
-                }
+                // o verificador ja registrou o tipo certo de login
+                // (password_auth, device_auth ou user_auth)
+                ServerEvent::PlainLogin { .. } => {}
                 ServerEvent::UpdateRequest { incremental, rect } => {
                     // pedido nao incremental sobrepoe o incremental pendente
                     let inc = incremental && view.pending.is_none_or(|(i, _)| i);
@@ -641,7 +731,8 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                     // sem credencial, so com autorizacao local (allow_attended)
                     let ask = sh.cfg.ask_before_accept
                         || (srv.unauthenticated() && !sh.cfg.allow_no_auth);
-                    if ask && !tray::ask_accept(peer).await {
+                    let label = who.lock().map(|w| w.clone()).unwrap_or_default();
+                    if ask && !tray::ask_accept(&tray::who_label(&label, peer)).await {
                         sh.audit
                             .record("rejected", &[("peer", peer), ("reason", "local_user")]);
                         anyhow::bail!("recusado pelo usuario local");
@@ -653,6 +744,9 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                     };
                     sh.audit
                         .record("session", &[("peer", peer), ("encryption", enc)]);
+                    if let Some(ip) = lockout::peer_ip(peer) {
+                        sh.lockout.success(ip);
+                    }
                 }
                 ServerEvent::Encodings(e) => tracing::debug!(?e, "encodings"),
                 ServerEvent::PixelFormatChanged(pf) => tracing::debug!(?pf, "formato"),
@@ -696,7 +790,15 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                 }
                 if let Err(e) = srv.feed(&buf[..n]) {
                     // entrega o motivo (ex.: SecurityResult de falha) e
-                    // fecha limpo (close_notify no TLS)
+                    // fecha limpo (close_notify no TLS). Falha de senha
+                    // conta antes de responder: o cliente nao pode
+                    // reconectar antes de o bloqueio valer
+                    while let Some(ev) = srv.poll_event() {
+                        if matches!(ev, ServerEvent::AuthFailed) {
+                            sh.audit.record("auth_failed", &[("peer", peer)]);
+                            lock_fail(sh, peer);
+                        }
+                    }
                     let out = srv.take_output();
                     let _ = sock.write_all(&out).await;
                     let _ = sock.shutdown().await;
@@ -712,6 +814,65 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Conta uma falha de autenticacao de `peer` e audita se virou bloqueio.
+pub(crate) fn lock_fail(sh: &Shared, peer: &str) {
+    let Some(ip) = lockout::peer_ip(peer) else {
+        return;
+    };
+    if let Some(d) = sh.lockout.fail(ip, Instant::now()) {
+        let secs = d.as_secs().to_string();
+        tracing::warn!(peer, secs, "IP bloqueado por falhas de autenticacao");
+        sh.audit
+            .record("lockout", &[("peer", peer), ("secs", &secs)]);
+    }
+}
+
+/// Encaminha a auditoria ao servidor central numa thread propria: fila
+/// limitada, envio em lotes, melhor esforco (falhas so geram aviso e o
+/// segredo nunca vai para o log).
+fn start_audit_forward(cfg: &config::Config, audit: &AuditLog) -> anyhow::Result<()> {
+    let (Some(url), Some(id)) = (&cfg.central_url, &cfg.central_machine_id) else {
+        return Ok(());
+    };
+    let secret = cfg
+        .central_secret()
+        .ok_or_else(|| anyhow::anyhow!("central_secret ausente"))?;
+    let ca = match &cfg.oidc_ca {
+        Some(p) => Some(std::fs::read(p).with_context(|| format!("lendo {}", p.display()))?),
+        None => None,
+    };
+    let c = openvnc_security::central::Central::new(url, ca.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+    audit.set_forward(tx);
+    let id = id.clone();
+    std::thread::Builder::new()
+        .name("audit-central".into())
+        .spawn(move || {
+            let mut warned = false;
+            while let Ok(first) = rx.recv() {
+                let mut batch = first;
+                while let Ok(l) = rx.try_recv() {
+                    batch.push('\n');
+                    batch.push_str(&l);
+                    if batch.len() > 128 * 1024 {
+                        break;
+                    }
+                }
+                match c.send_audit(&id, &secret, &batch) {
+                    Ok(()) => warned = false,
+                    Err(e) if !warned => {
+                        tracing::warn!("auditoria nao enviada ao central: {e}");
+                        warned = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+        })?;
+    tracing::info!(%url, "auditoria encaminhada ao servidor central");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1124,5 +1285,32 @@ mod tests {
         assert!(log.contains("\"device_auth\""), "{log}");
         assert!(log.contains("revoked"), "{log}");
         assert!(log.contains("bad_token"), "{log}");
+    }
+
+    /// Ponta a ponta: 5 senhas erradas bloqueiam o IP, inclusive a senha
+    /// certa, e o bloqueio vai para a auditoria.
+    #[tokio::test]
+    async fn forca_bruta_bloqueia_o_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tls_cfg(dir.path());
+        let fp = identity(&cfg).unwrap().fingerprint();
+        let addr = start(cfg, Some("certa")).await;
+        let cc = |p: &str| CConfig {
+            password: Some(Password::new(p)),
+            ..Default::default()
+        };
+        tls_session(addr, fp.clone(), cc("certa")).await.unwrap();
+        for _ in 0..lockout::FREE_FAILS {
+            assert!(tls_session(addr, fp.clone(), cc("errada")).await.is_err());
+        }
+        // bloqueado: nem a senha certa entra
+        assert!(tls_session(addr, fp, cc("certa")).await.is_err());
+        let log = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        assert!(log.contains("\"lockout\""), "{log}");
+        assert!(log.contains("\"reason\":\"lockout\""), "{log}");
+        assert!(
+            !log.contains("errada") && !log.contains("certa"),
+            "senha no log: {log}"
+        );
     }
 }

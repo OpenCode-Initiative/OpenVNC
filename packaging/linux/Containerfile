@@ -1,0 +1,6 @@
+FROM docker.io/library/rust:1-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libx11-dev libxcb1-dev libxkbcommon-dev libxext-dev libxdamage-dev \
+      libxfixes-dev libxtst-dev libwayland-dev libgl1-mesa-dev libssl-dev nasm \
+      dpkg-dev \
+ && rm -rf /var/lib/apt/lists/*

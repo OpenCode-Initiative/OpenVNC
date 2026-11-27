@@ -49,7 +49,8 @@ impl ConnectOptions {
             address: address.into(),
             config: Config::default(),
             connect_timeout: Duration::from_secs(10),
-            handshake_timeout: Duration::from_secs(10),
+            // > 30 s do pedido de aprovacao no host (ask_before_accept)
+            handshake_timeout: Duration::from_secs(45),
             reconnect: true,
             backoff: Backoff::default(),
             tls: None,
@@ -164,6 +165,39 @@ impl Session {
             frame: frame.clone(),
         };
         rt.spawn(run(opts, cmd_rx, ctx));
+        Session {
+            cmd: cmd_tx,
+            events: ev_rx,
+            frame,
+        }
+    }
+
+    /// Sessao pelo protocolo nativo (TLS/QUIC), com os mesmos eventos e
+    /// quadro compartilhado da sessao RFB. Usada para SSO OIDC, que so
+    /// existe no protocolo nativo. Nao reconecta (o token e de uso unico).
+    pub fn spawn_native(
+        rt: &tokio::runtime::Handle,
+        opts: native::NativeOptions,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> Session {
+        let (cmd_tx, cmd_rx) = tmpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let frame = Arc::new(Mutex::new(SharedFrame::default()));
+        let ctx = Ctx {
+            ev: ev_tx,
+            notify,
+            frame: frame.clone(),
+        };
+        rt.spawn(async move {
+            let reason = match run_native(opts, cmd_rx, &ctx).await {
+                Ok(()) => "encerrada".to_string(),
+                Err(e) => e.to_string(),
+            };
+            ctx.emit(SessionEvent::Disconnected {
+                reason,
+                retrying: false,
+            });
+        });
         Session {
             cmd: cmd_tx,
             events: ev_rx,
@@ -349,6 +383,89 @@ async fn drive(
     }
 }
 
+/// Publica o framebuffer nativo inteiro (conexao ou novo tamanho).
+fn publish_full(ctx: &Ctx, fb: &Framebuffer) {
+    let mut f = ctx.frame.lock().expect("mutex");
+    f.fb = Some(fb.clone());
+    f.damage = vec![Rect::new(0, 0, fb.width(), fb.height())];
+    f.generation += 1;
+}
+
+async fn run_native(
+    opts: native::NativeOptions,
+    mut cmds: tmpsc::UnboundedReceiver<Command>,
+    ctx: &Ctx,
+) -> Result<()> {
+    use native::{NativeClient, NativeEvent};
+    use openvnc_protocol::Input;
+    let mut c = tokio::select! {
+        r = NativeClient::connect(&opts) => r?,
+        _ = wait_close(&mut cmds) => return Ok(()),
+    };
+    let tx = c.sender();
+    publish_full(ctx, c.framebuffer());
+    ctx.emit(SessionEvent::Connected {
+        width: c.framebuffer().width(),
+        height: c.framebuffer().height(),
+        name: c.display_name().to_string(),
+        version: ProtocolVersion::V3_8,
+        encrypted: true,
+        legacy_auth: false,
+    });
+    ctx.emit(SessionEvent::Updated);
+    loop {
+        tokio::select! {
+            e = c.next_event() => match e? {
+                NativeEvent::Frame(rects) => {
+                    let src = c.framebuffer();
+                    let mut f = ctx.frame.lock().expect("mutex");
+                    if let Some(dst) = f.fb.as_mut() {
+                        for r in &rects {
+                            dst.copy_from(src, *r);
+                        }
+                        dst.take_damage();
+                    }
+                    f.damage.extend(rects);
+                    if f.damage.len() > 256 {
+                        let bb = f.damage.iter().fold(Rect::default(), |a, d| a.union(d));
+                        f.damage = vec![bb];
+                    }
+                    drop(f);
+                    ctx.emit(SessionEvent::Updated);
+                }
+                NativeEvent::Resized(width, height) => {
+                    publish_full(ctx, c.framebuffer());
+                    ctx.emit(SessionEvent::Resized { width, height });
+                }
+                NativeEvent::Clipboard(t) => ctx.emit(SessionEvent::CutText(t)),
+                NativeEvent::FileOffer { id, .. } => {
+                    let _ = c.reject_file(id);
+                }
+                _ => {}
+            },
+            m = cmds.recv() => match m {
+                None | Some(Command::Close) => {
+                    c.close().await;
+                    return Ok(());
+                }
+                Some(Command::Key(k)) => tx.input(Input::Key { keysym: k.keysym, down: k.down })?,
+                Some(Command::Pointer(p)) => {
+                    tx.input(Input::Pointer { x: p.x, y: p.y, buttons: p.buttons })?
+                }
+                Some(Command::CutText(t)) => tx.clipboard(t)?,
+            },
+        }
+    }
+}
+
+async fn wait_close(cmds: &mut tmpsc::UnboundedReceiver<Command>) {
+    while let Some(c) = cmds.recv().await {
+        if matches!(c, Command::Close) {
+            return;
+        }
+    }
+}
+
 fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) {
     match e {
         Event::Connected {
@@ -358,7 +475,9 @@ fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) 
             version,
             security,
         } => {
-            *connected = true;
+            // so conta como conectado apos o primeiro update: o host pode recusar
+            // (ask_before_accept) logo depois do ServerInit, e isso nao deve
+            // disparar reconexao em loop.
             {
                 let mut f = ctx.frame.lock().expect("mutex");
                 f.fb = client.framebuffer().cloned();
@@ -380,6 +499,7 @@ fn handle_event(e: Event, client: &mut Client, ctx: &Ctx, connected: &mut bool) 
             });
         }
         Event::UpdateComplete => {
+            *connected = true;
             let mut changed = false;
             if let Some(src) = client.framebuffer_mut() {
                 let damage = src.take_damage();

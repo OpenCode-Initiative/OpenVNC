@@ -33,8 +33,8 @@ struct Conn {
     /// Pede acesso exclusivo (desconecta outros clientes)
     #[arg(long)]
     exclusive: bool,
-    /// Timeout total em segundos
-    #[arg(long, default_value_t = 15)]
+    /// Timeout total em segundos (cobre os 30 s da aprovacao no host)
+    #[arg(long, default_value_t = 45)]
     timeout: u64,
     /// Exige VeNCrypt (TLS 1.3); sem downgrade para texto claro
     #[arg(long)]
@@ -84,9 +84,41 @@ enum Cmd {
         /// Transporte: auto, quic ou tcp
         #[arg(long, default_value = "auto")]
         transport: String,
+        /// Login SSO (OpenID Connect): mostra um codigo para aprovar no navegador
+        #[arg(long)]
+        sso: bool,
+        /// CA extra (PEM) do provedor SSO, se nao estiver instalada no sistema
+        #[arg(long, value_name = "PEM")]
+        sso_ca: Option<PathBuf>,
+        /// Servidor central da empresa (https://...): `address` vira o id da
+        /// maquina e `--user` o usuario do central. Senha em
+        /// OPENVNC_CENTRAL_PASSWORD, --password-stdin ou pedida no terminal.
+        #[arg(long, value_name = "URL")]
+        central: Option<String>,
+        /// CA (PEM) do servidor central (`openvnc-central export-ca`)
+        #[arg(long, value_name = "PEM")]
+        central_ca: Option<PathBuf>,
+        /// Depois do primeiro quadro, envia Shift pressionado e solto (teste
+        /// de permissao de controle; nao digita nada)
+        #[arg(long)]
+        nudge: bool,
         /// Arquivo de saida
         #[arg(short, long, default_value = "screenshot.png")]
         output: PathBuf,
+    },
+    /// Entra no servidor central e lista as maquinas liberadas
+    CentralLogin {
+        /// URL do servidor central (https://...)
+        url: String,
+        /// Usuario do central
+        #[arg(long)]
+        user: String,
+        /// CA (PEM) do servidor central
+        #[arg(long, value_name = "PEM")]
+        ca: Option<PathBuf>,
+        /// Le a senha da primeira linha da entrada padrao
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Conecta e mostra informacoes do servidor
     Info {
@@ -139,6 +171,76 @@ fn tls_options(c: &Conn) -> anyhow::Result<Option<ClientTls>> {
         return Ok(None);
     };
     Ok(Some(ClientTls { trust }))
+}
+
+/// Senha do servidor central: variavel de ambiente, stdin ou terminal.
+/// Nunca vem de argumento.
+fn central_password(stdin: bool) -> anyhow::Result<String> {
+    if !stdin {
+        if let Ok(p) = std::env::var("OPENVNC_CENTRAL_PASSWORD") {
+            return Ok(p);
+        }
+        eprint!("senha do servidor central: ");
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let p = line.trim_end_matches(['\r', '\n']).to_owned();
+    if p.is_empty() {
+        bail!("senha vazia");
+    }
+    Ok(p)
+}
+
+fn central_client(
+    url: &str,
+    ca: Option<&PathBuf>,
+) -> anyhow::Result<openvnc_security::central::Central> {
+    let pem = match ca {
+        Some(p) => Some(std::fs::read(p).with_context(|| format!("lendo {}", p.display()))?),
+        None => None,
+    };
+    openvnc_security::central::Central::new(url, pem.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Modo servidor central: login, ticket para a maquina e opcoes nativas
+/// com o ticket no lugar do token OIDC.
+fn central_native(
+    c: &Conn,
+    url: &str,
+    ca: Option<&PathBuf>,
+    transport: openvnc_client::native::NativeTransport,
+) -> anyhow::Result<openvnc_client::native::NativeOptions> {
+    use openvnc_client::native::*;
+    let user = c.user.as_deref().context("--central exige --user")?;
+    let central = central_client(url, ca)?;
+    let pw = central_password(c.password_stdin)?;
+    let s = central.login(user, &pw).map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(pw);
+    let list = central.machines(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let m = list
+        .iter()
+        .find(|m| m.id == c.address)
+        .with_context(|| format!("maquina {} nao liberada para {user}", c.address))?;
+    let ticket = central
+        .ticket(&s, &m.id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let trust = if let Some(fp) = c.pin.as_deref().or(m.fingerprint.as_deref()) {
+        Trust::Pinned(normalize_fingerprint(fp)?)
+    } else if let Some(p) = &c.ca {
+        Trust::WebPki {
+            extra_roots: load_certs(&std::fs::read(p)?)?,
+        }
+    } else {
+        Trust::default()
+    };
+    eprintln!("central: ticket para {} ({})", m.id, m.perms.join(","));
+    Ok(NativeOptions {
+        address: format!("{}:{}", m.address, m.port),
+        tls: ClientTls { trust },
+        transport,
+        auth: NativeAuth::OidcToken(ticket),
+        timeout: Duration::from_secs(c.timeout),
+    })
 }
 
 fn connect(
@@ -248,6 +350,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::Native {
             conn,
             transport,
+            sso,
+            sso_ca,
+            central,
+            central_ca,
+            nudge,
             output,
         } => {
             use openvnc_client::native::*;
@@ -257,24 +364,54 @@ fn main() -> anyhow::Result<()> {
                 "tcp" => NativeTransport::Tcp,
                 t => bail!("transporte invalido: {t} (auto, quic, tcp)"),
             };
-            let o = options(&conn)?;
-            let tls = o
-                .tls
-                .context("o protocolo nativo exige --tls, --pin, --tofu ou --ca")?;
-            let secret = o.config.password.as_ref().map(|p| p.expose().to_string());
-            let auth = match (conn.user.clone(), secret) {
-                (Some(id), Some(token)) => NativeAuth::Device { id, token },
-                (None, Some(p)) => NativeAuth::Password(p),
-                (_, None) => NativeAuth::None,
-            };
-            let no = NativeOptions {
-                address: conn.address.clone(),
-                tls,
-                transport,
-                auth,
-                timeout: Duration::from_secs(conn.timeout),
+            let no = if let Some(url) = &central {
+                central_native(&conn, url, central_ca.as_ref(), transport)?
+            } else {
+                let o = options(&conn)?;
+                let tls = o
+                    .tls
+                    .context("o protocolo nativo exige --tls, --pin, --tofu ou --ca")?;
+                let secret = o.config.password.as_ref().map(|p| p.expose().to_string());
+                let auth = match (conn.user.clone(), secret) {
+                    (Some(id), Some(token)) => NativeAuth::Device { id, token },
+                    (None, Some(p)) => NativeAuth::Password(p),
+                    (_, None) => NativeAuth::None,
+                };
+                NativeOptions {
+                    address: conn.address.clone(),
+                    tls,
+                    transport,
+                    auth,
+                    timeout: Duration::from_secs(conn.timeout),
+                }
             };
             rt.block_on(async {
+                let no = if sso {
+                    NativeClient::oidc_login(
+                        &no,
+                        |c| {
+                            match &c.verification_uri_complete {
+                                Some(u) => eprintln!("SSO: abra {u}"),
+                                None => eprintln!(
+                                    "SSO: abra {} e digite o codigo {}",
+                                    c.verification_uri, c.user_code
+                                ),
+                            }
+                            eprintln!("(codigo {}, valido por {} s)", c.user_code, c.expires_in);
+                        },
+                        || false,
+                        match &sso_ca {
+                            Some(p) => Some(
+                                std::fs::read(p)
+                                    .with_context(|| format!("lendo {}", p.display()))?,
+                            ),
+                            None => None,
+                        },
+                    )
+                    .await?
+                } else {
+                    no
+                };
                 let mut c = NativeClient::connect(&no).await?;
                 println!(
                     "conectado via {} a \"{}\" ({}x{})",
@@ -292,6 +429,17 @@ fn main() -> anyhow::Result<()> {
                         break;
                     }
                 }
+                if nudge {
+                    use openvnc_protocol::Input;
+                    for down in [true, false] {
+                        c.send_input(Input::Key {
+                            keysym: keysym::SHIFT_L,
+                            down,
+                        })?;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    println!("entrada enviada (Shift)");
+                }
                 let fb = c.framebuffer();
                 write_png(
                     &output,
@@ -308,6 +456,31 @@ fn main() -> anyhow::Result<()> {
                 c.close().await;
                 anyhow::Ok(())
             })?;
+        }
+        Cmd::CentralLogin {
+            url,
+            user,
+            ca,
+            password_stdin,
+        } => {
+            let central = central_client(&url, ca.as_ref())?;
+            let pw = central_password(password_stdin)?;
+            let s = central
+                .login(&user, &pw)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            drop(pw);
+            let list = central.machines(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{} maquina(s) liberada(s) para {}:", list.len(), s.user);
+            for m in list {
+                println!(
+                    "  {}  {}  {}:{}  {}",
+                    m.id,
+                    m.name,
+                    m.address,
+                    m.port,
+                    m.perms.join(",")
+                );
+            }
         }
         Cmd::Screenshot { conn, output } => {
             let (sess, _, deadline) = connect(&conn, &rt)?;

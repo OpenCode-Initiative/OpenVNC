@@ -163,6 +163,17 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
                 );
                 continue;
             }
+            if sh2
+                .lockout
+                .blocked(peer.ip(), std::time::Instant::now())
+                .is_some()
+            {
+                sh2.audit.record(
+                    "rejected",
+                    &[("peer", &peer.to_string()), ("reason", "lockout")],
+                );
+                continue;
+            }
             let _ = sock.set_nodelay(true);
             let acc = acceptor.clone();
             let sh = sh2.clone();
@@ -213,6 +224,17 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
                 sh.audit
                     .record("rejected", &[("peer", &peer), ("reason", "lan_only")]);
                 s.connection.close(5u32.into(), b"fora da rede local");
+                return;
+            }
+            if sh
+                .lockout
+                .blocked(addr.ip(), std::time::Instant::now())
+                .is_some()
+            {
+                sh.audit
+                    .record("rejected", &[("peer", &peer), ("reason", "lockout")]);
+                s.connection
+                    .close(5u32.into(), b"bloqueado temporariamente");
                 return;
             }
             let Some(_slot) = Slot::take(&sh, &peer) else {
@@ -309,11 +331,14 @@ async fn run_session(
 /// Metodos de autenticacao oferecidos pela configuracao.
 fn methods(sh: &Shared) -> Vec<u8> {
     let mut m = Vec::new();
-    if sh.password.is_some() || sh.cfg.password_hash.is_some() {
+    if sh.password.is_some() || sh.cfg.password_hash.is_some() || sh.cfg.ext_auth().is_some() {
         m.push(auth_method::PASSWORD);
     }
     if sh.devices.is_some() {
         m.push(auth_method::DEVICE);
+    }
+    if sh.oidc.is_some() {
+        m.push(auth_method::OIDC);
     }
     if sh.cfg.allow_no_auth || sh.cfg.allow_attended {
         m.push(auth_method::NONE);
@@ -326,19 +351,92 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Confere as credenciais. `Err` traz o motivo (sem o segredo).
+/// Permissoes da sessao vindas do ticket do servidor central. Sem
+/// ticket do central (`perms: None`) vale tudo o que a configuracao
+/// local permite.
+#[derive(Debug, Clone, Default)]
+struct SessionPerms {
+    perms: Option<Vec<String>>,
+    ask: Option<bool>,
+}
+
+impl SessionPerms {
+    fn has(&self, p: &str) -> bool {
+        self.perms.as_ref().is_none_or(|v| v.iter().any(|x| x == p))
+    }
+
+    fn label(&self) -> String {
+        match &self.perms {
+            Some(v) => v.join(","),
+            None => "local".into(),
+        }
+    }
+}
+
+/// Confere as credenciais e devolve o usuario efetivo. `Err` traz o motivo
+/// (sem o segredo).
 fn check_auth(
     sh: &Shared,
     peer: &str,
     method: u8,
     user: &str,
     secret: &[u8],
-) -> Result<(), String> {
+) -> Result<(String, SessionPerms), String> {
     if !methods(sh).contains(&method) {
         return Err("metodo nao permitido".into());
     }
+    if method == auth_method::OIDC {
+        let Some(v) = &sh.oidc else {
+            return Err("SSO desligado".into());
+        };
+        return match v.verify(secret) {
+            Ok(id) => {
+                sh.audit
+                    .record("oidc_auth", &[("peer", peer), ("user", &id.user)]);
+                // com central_machine_id o ticket precisa trazer permissoes
+                let perms = match (&sh.cfg.central_machine_id, id.perms) {
+                    (Some(_), None) => return Err("ticket sem permissoes".into()),
+                    (_, p) => p,
+                };
+                Ok((id.user, SessionPerms { perms, ask: id.ask }))
+            }
+            Err(e) => {
+                let why = e.to_string();
+                sh.audit
+                    .record("oidc_auth_failed", &[("peer", peer), ("reason", &why)]);
+                Err(format!("SSO recusado: {why}"))
+            }
+        };
+    }
+    check_local(sh, peer, method, user, secret).map(|()| (user.to_owned(), SessionPerms::default()))
+}
+
+fn check_local(
+    sh: &Shared,
+    peer: &str,
+    method: u8,
+    user: &str,
+    secret: &[u8],
+) -> Result<(), String> {
     match method {
         auth_method::NONE => Ok(()),
+        auth_method::PASSWORD if !user.is_empty() && user != crate::config::REMOTE_USER => {
+            let Some(cmd) = sh.cfg.ext_auth() else {
+                return Err("contas de usuario desligadas (sem auth_command)".into());
+            };
+            let t = std::time::Duration::from_secs(sh.cfg.auth_timeout_secs);
+            let r = crate::extauth::check(cmd, t, user, peer, secret);
+            match &r {
+                Ok(()) => sh
+                    .audit
+                    .record("user_auth", &[("peer", peer), ("user", user)]),
+                Err(why) => sh.audit.record(
+                    "user_auth_failed",
+                    &[("peer", peer), ("user", user), ("reason", why)],
+                ),
+            }
+            r
+        }
         auth_method::PASSWORD => {
             let ok = match (&sh.cfg.password_hash, &sh.password) {
                 (Some(h), _) => openvnc_security::passhash::verify(secret, h),
@@ -385,7 +483,7 @@ async fn handshake(
     peer: &str,
     inbox: &mut mpsc::Receiver<Message>,
     ctrl: &mpsc::Sender<Message>,
-) -> anyhow::Result<(Vec<u32>, bool)> {
+) -> anyhow::Result<(Vec<u32>, bool, String, SessionPerms)> {
     let Some(Message::ClientHello {
         min_version,
         max_version,
@@ -412,6 +510,15 @@ async fn handshake(
     if sh.cfg.files_send || sh.cfg.files_receive {
         ours.push(capability::FILE_TRANSFER);
     }
+    if sh.oidc.is_some() {
+        ours.push(capability::AUTH_OIDC);
+    }
+    if sh.cfg.files_send || sh.cfg.files_receive {
+        ours.push(capability::FS_EXPLORER);
+    }
+    if sh.input.is_some() {
+        ours.push(capability::INPUT_LOCK);
+    }
     let caps: Vec<u32> = capabilities
         .iter()
         .copied()
@@ -425,6 +532,23 @@ async fn handshake(
         name: sh.cfg.name.clone(),
     })
     .await?;
+    if caps.contains(&capability::AUTH_OIDC) {
+        if let (Some(issuer), Some(client_id)) = (&sh.cfg.oidc_issuer, &sh.cfg.oidc_client_id) {
+            ctrl.send(Message::OidcConfig {
+                issuer: issuer.clone(),
+                client_id: client_id.clone(),
+                scope: match &sh.cfg.central_machine_id {
+                    Some(m) => format!(
+                        "{} {}{m}",
+                        sh.cfg.oidc_scope,
+                        openvnc_security::oidc::SCOPE_MACHINE
+                    ),
+                    None => sh.cfg.oidc_scope.clone(),
+                },
+            })
+            .await?;
+        }
+    }
     let Some(Message::AuthRequest {
         method,
         user,
@@ -434,25 +558,38 @@ async fn handshake(
         close(ctrl, close_code::PROTOCOL_ERROR, "esperava AUTH_REQUEST").await;
         bail!("esperava AUTH_REQUEST");
     };
-    if let Err(reason) = check_auth(sh, peer, method, &user, &secret) {
-        sh.audit
-            .record("auth_failed", &[("peer", peer), ("reason", &reason)]);
-        ctrl.send(Message::AuthResult {
-            ok: false,
-            reason: reason.clone(),
-        })
-        .await?;
-        close(ctrl, close_code::AUTH_FAILED, &reason).await;
-        bail!("autenticacao: {reason}");
-    }
+    let checked = if method == auth_method::OIDC || sh.cfg.ext_auth().is_some() {
+        // pode fazer rede ou rodar programa: fora das threads do runtime
+        tokio::task::block_in_place(|| check_auth(sh, peer, method, &user, &secret))
+    } else {
+        check_auth(sh, peer, method, &user, &secret)
+    };
+    let (user, perms) = match checked {
+        Ok(u) => u,
+        Err(reason) => {
+            sh.audit
+                .record("auth_failed", &[("peer", peer), ("reason", &reason)]);
+            crate::lock_fail(sh, peer);
+            ctrl.send(Message::AuthResult {
+                ok: false,
+                reason: reason.clone(),
+            })
+            .await?;
+            close(ctrl, close_code::AUTH_FAILED, &reason).await;
+            bail!("autenticacao: {reason}");
+        }
+    };
     sh.audit
         .record("auth_ok", &[("peer", peer), ("user", &user)]);
+    if let Some(ip) = crate::lockout::peer_ip(peer) {
+        sh.lockout.success(ip);
+    }
     ctrl.send(Message::AuthResult {
         ok: true,
         reason: String::new(),
     })
     .await?;
-    Ok((caps, method == auth_method::NONE))
+    Ok((caps, method == auth_method::NONE, user, perms))
 }
 
 async fn session(
@@ -462,19 +599,35 @@ async fn session(
     ctrl: &mpsc::Sender<Message>,
     gfx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
-    let (caps, no_auth) =
+    let (caps, no_auth, user, perms) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(sh, peer, &mut inbox, ctrl))
             .await
             .map_err(|_| anyhow::anyhow!("timeout no handshake"))??;
     // sem credencial, so com autorizacao local (allow_attended)
-    let ask = sh.cfg.ask_before_accept || (no_auth && !sh.cfg.allow_no_auth);
-    if ask && !crate::tray::ask_accept(peer).await {
+    if !perms.has("view") {
+        sh.audit
+            .record("rejected", &[("peer", peer), ("reason", "sem_permissao_view")]);
+        close(ctrl, close_code::AUTH_FAILED, "sem permissao de ver a tela").await;
+        bail!("ticket sem permissao view");
+    }
+    let control = perms.has("control");
+    let mut input_denied = false;
+    sh.audit.record(
+        "session_perms",
+        &[("peer", peer), ("user", &user), ("perms", &perms.label())],
+    );
+    // o central pode exigir ou dispensar a aprovacao local
+    let ask = match perms.ask {
+        Some(a) => a,
+        None => sh.cfg.ask_before_accept,
+    } || (no_auth && !sh.cfg.allow_no_auth);
+    if ask && !crate::tray::ask_accept(&crate::tray::who_label(&user, peer)).await {
         sh.audit
             .record("rejected", &[("peer", peer), ("reason", "local_user")]);
         close(ctrl, close_code::AUTH_FAILED, "recusado pelo usuario local").await;
         bail!("recusado pelo usuario local");
     }
-    let files_ok = caps.contains(&capability::FILE_TRANSFER);
+    let files_ok = caps.contains(&capability::FILE_TRANSFER) && perms.has("files");
     let mut inbound = (files_ok && sh.cfg.files_receive).then(|| {
         openvnc_client::files::Inbound::new(
             sh.cfg.files_dir(),
@@ -483,6 +636,13 @@ async fn session(
     });
     let mut outbound = crate::files::Outbound::default();
     let mut offers = (files_ok && sh.cfg.files_send).then(crate::files::subscribe);
+    let fsx = crate::fsexplorer::Explorer::new(
+        &sh.cfg,
+        caps.contains(&capability::FS_EXPLORER) && perms.has("files"),
+    );
+    let lock_ok = control && sh.input.is_some() && caps.contains(&capability::INPUT_LOCK);
+    let mut lock: Option<Locked> = None;
+    let mut last_seen = std::time::Instant::now();
     let zlib = caps.contains(&capability::TILE_ZLIB);
     let mut video = Video::new(caps.contains(&capability::VIDEO_H264));
     let mut frames = sh.frames.clone();
@@ -529,7 +689,7 @@ async fn session(
             }
         }
         tokio::select! {
-            m = inbox.recv() => match m {
+            m = inbox.recv() => { last_seen = std::time::Instant::now(); match m {
                 None => return Ok(()),
                 Some(Message::FrameAck { seq: s }) => {
                     if s > seq {
@@ -537,7 +697,15 @@ async fn session(
                     }
                     acked = acked.max(s);
                 }
-                Some(Message::InputEvent(ev)) => forward(sh, ev),
+                Some(Message::InputEvent(ev)) => {
+                    // sem permissao de controle: so assiste
+                    if control {
+                        forward(sh, ev);
+                    } else if !input_denied {
+                        input_denied = true;
+                        sh.audit.record("input_denied", &[("peer", peer), ("user", &user)]);
+                    }
+                }
                 Some(Message::Ping { nonce }) => ctrl.send(Message::Pong { nonce }).await?,
                 Some(Message::Pong { .. }) => {}
                 Some(Message::Close { .. }) => return Ok(()),
@@ -570,11 +738,44 @@ async fn session(
                     }
                 }
                 Some(Message::FileAccept { id, accept }) => outbound.answer(id, accept, ctrl.clone()),
+                Some(Message::FsRequest { id, op }) => {
+                    let reply = tokio::task::block_in_place(|| fsx.handle(&op));
+                    crate::fsexplorer::audit(&sh.audit, peer, &user, &op, &reply);
+                    ctrl.send(Message::FsResponse { id, reply }).await?;
+                }
+                Some(Message::InputLock { on }) => {
+                    let reason = if !on {
+                        if let Some(mut l) = lock.take() {
+                            l.reason = "cliente";
+                        }
+                        String::new()
+                    } else if !lock_ok {
+                        "sem permissao de controle".to_string()
+                    } else if lock.is_some() {
+                        String::new()
+                    } else {
+                        match crate::inputlock::Manager::acquire(crate::inputlock::global()) {
+                            Ok(h) => {
+                                lock = Some(Locked {
+                                    _hold: h,
+                                    audit: sh.audit.clone(),
+                                    peer: peer.to_string(),
+                                    user: user.clone(),
+                                    reason: "sessao encerrada",
+                                });
+                                sh.audit.record("input_lock", &[("peer", peer), ("user", &user)]);
+                                String::new()
+                            }
+                            Err(e) => e,
+                        }
+                    };
+                    ctrl.send(Message::InputLockState { on: lock.is_some(), reason }).await?;
+                }
                 Some(other) => {
                     close(ctrl, close_code::PROTOCOL_ERROR, "mensagem inesperada").await;
                     bail!("mensagem inesperada: tipo {:#06x}", other.type_code());
                 }
-            },
+            }},
             p = async { offers.as_mut().expect("guardado").recv().await }, if offers.is_some() => {
                 match p {
                     Ok(path) => {
@@ -601,6 +802,13 @@ async fn session(
                     }
                 }
             }
+            _ = tokio::time::sleep_until(crate::inputlock::idle_deadline(last_seen).into()), if lock.is_some() => {
+                // conexao parada: solta mouse e teclado do usuario local
+                if let Some(mut l) = lock.take() {
+                    l.reason = "inatividade";
+                }
+                let _ = ctrl.try_send(Message::InputLockState { on: false, reason: "liberado por inatividade".into() });
+            }
             r = frames.changed(), if seq - acked < WINDOW => {
                 if r.is_err() {
                     close(ctrl, close_code::SERVER_SHUTDOWN, "captura encerrada").await;
@@ -608,6 +816,25 @@ async fn session(
                 }
             }
         }
+    }
+}
+
+/// Bloqueio ativo da sessao. Ao ser solto (pelo cliente, por inatividade ou
+/// porque a sessao terminou de qualquer jeito) registra `input_unlock`.
+struct Locked {
+    _hold: crate::inputlock::Hold,
+    audit: Arc<openvnc_security::audit::AuditLog>,
+    peer: String,
+    user: String,
+    reason: &'static str,
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        self.audit.record(
+            "input_unlock",
+            &[("peer", &self.peer), ("user", &self.user), ("reason", self.reason)],
+        );
     }
 }
 

@@ -1031,7 +1031,13 @@ fn window(title: &str, size: [f32; 2]) -> eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size(size)
-            .with_resizable(true),
+            .with_resizable(true)
+            .with_icon(std::sync::Arc::new(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../assets/brand/openvnc-256.png"
+                ))
+                .unwrap_or_default(),
+            )),
         ..Default::default()
     }
 }

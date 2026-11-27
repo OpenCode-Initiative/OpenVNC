@@ -14,6 +14,13 @@ zeroize.workspace = true
 sha2.workspace = true
 rand.workspace = true
 argon2 = { version = "0.5", features = ["std"] }
+ring = "0.17"
+rustls.workspace = true
+webpki-roots.workspace = true
+rustls-native-certs = "0.8"
+base64 = "0.22"
+serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3"

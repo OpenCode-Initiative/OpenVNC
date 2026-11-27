@@ -5,6 +5,8 @@
 //! apenas por compatibilidade e a UI deve sinalizar isso ao usuario.
 
 pub mod audit;
+pub mod central;
+pub mod oidc;
 pub mod pairing;
 pub mod passhash;
 

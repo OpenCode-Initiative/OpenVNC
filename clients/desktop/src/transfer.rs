@@ -14,7 +14,8 @@ use openvnc_client::native::{
     NativeAuth, NativeClient, NativeEvent, NativeOptions, NativeTransport,
 };
 use openvnc_transport::tls::ClientTls;
-use tokio::sync::mpsc;
+use openvnc_protocol::{FsOp, FsReply};
+use tokio::sync::{mpsc, oneshot};
 
 /// Tamanho maximo aceito por arquivo recebido.
 const MAX_DOWNLOAD: u64 = 16 * 1024 * 1024 * 1024;
@@ -52,12 +53,41 @@ pub struct Shared {
     pub items: Vec<Item>,
     /// Ofertas do servidor aguardando decisao: (id, nome, tamanho).
     pub offers: Vec<(u32, String, u64)>,
+    /// Mouse e teclado do computador remoto bloqueados (confirmado pelo
+    /// servidor).
+    pub lock_on: bool,
+    /// Ultimo motivo informado pelo servidor sobre o bloqueio.
+    pub lock_msg: String,
 }
 
 enum Cmd {
     Offer(PathBuf),
     Accept(u32),
     Reject(u32),
+    Fs(FsOp, oneshot::Sender<FsReply>),
+    Lock(bool),
+}
+
+/// Acesso ao explorador remoto pela conexao de arquivos (clonavel, usado
+/// pelas tarefas de transferencia).
+#[derive(Clone)]
+pub struct FsClient(mpsc::UnboundedSender<Cmd>);
+
+impl FsClient {
+    /// Executa uma operacao e espera a resposta.
+    pub async fn call(&self, op: FsOp) -> FsReply {
+        let (tx, rx) = oneshot::channel();
+        if self.0.send(Cmd::Fs(op, tx)).is_err() {
+            return closed();
+        }
+        rx.await.unwrap_or_else(|_| closed())
+    }
+}
+
+fn closed() -> FsReply {
+    FsReply::Error {
+        message: "conexao de arquivos encerrada".into(),
+    }
 }
 
 /// Conexao de arquivos em segundo plano.
@@ -96,7 +126,7 @@ impl FileLink {
             tls,
             transport: NativeTransport::Auto,
             auth,
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(45),
         };
         rt.spawn(run(opts, download_dir.clone(), rx, shared.clone(), ctx));
         FileLink {
@@ -119,6 +149,16 @@ impl FileLink {
     /// Recusa uma oferta do servidor.
     pub fn reject(&self, id: u32) {
         let _ = self.tx.send(Cmd::Reject(id));
+    }
+
+    /// Cliente do explorador remoto.
+    pub fn fs(&self) -> FsClient {
+        FsClient(self.tx.clone())
+    }
+
+    /// Pede para bloquear (ou liberar) mouse e teclado do computador remoto.
+    pub fn lock(&self, on: bool) {
+        let _ = self.tx.send(Cmd::Lock(on));
     }
 }
 
@@ -158,13 +198,39 @@ async fn run(
         s.connected = true;
         s.status = format!("pronto ({})", c.transport());
     });
+    let sender = c.sender();
+    let mut waiting: std::collections::HashMap<u32, oneshot::Sender<FsReply>> =
+        std::collections::HashMap::new();
+    let mut next_fs = 0u32;
+    let mut locked = false;
+    // sinal de vida: com o bloqueio ligado o servidor solta tudo apos 10 s
+    // sem trafego, entao uma conexao travada nunca prende o usuario remoto
+    let mut beat = tokio::time::interval(Duration::from_secs(3));
+    let mut nonce = 0u64;
     loop {
         tokio::select! {
+            _ = beat.tick(), if locked => {
+                nonce += 1;
+                let _ = sender.ping(nonce);
+            }
             ev = c.next_event() => match ev {
+                Ok(NativeEvent::FsResponse { id, reply }) => {
+                    if let Some(w) = waiting.remove(&id) {
+                        let _ = w.send(reply);
+                    }
+                }
+                Ok(NativeEvent::InputLockState { on, reason }) => {
+                    locked = on;
+                    with(&shared, &ctx, |s| {
+                        s.lock_on = on;
+                        s.lock_msg = reason;
+                    });
+                }
                 Ok(ev) => on_event(&shared, &ctx, ev),
                 Err(e) => {
                     with(&shared, &ctx, |s| {
                         s.connected = false;
+                        s.lock_on = false;
                         s.status = format!("conexao de arquivos encerrada: {e}");
                         s.offers.clear();
                         for i in s.items.iter_mut().filter(|i| !i.finished) {
@@ -222,6 +288,19 @@ async fn run(
                             path: None,
                         });
                     });
+                }
+                Some(Cmd::Fs(op, w)) => {
+                    next_fs = next_fs.wrapping_add(1);
+                    if sender.fs(next_fs, op).is_ok() {
+                        waiting.insert(next_fs, w);
+                    } else {
+                        let _ = w.send(closed());
+                    }
+                }
+                Some(Cmd::Lock(on)) => {
+                    // liga o sinal de vida antes da confirmacao chegar
+                    locked = locked || on;
+                    let _ = sender.input_lock(on);
                 }
                 Some(Cmd::Reject(id)) => {
                     let _ = c.reject_file(id);

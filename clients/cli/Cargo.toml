@@ -16,6 +16,8 @@ openvnc-client.workspace = true
 openvnc-core.workspace = true
 openvnc-rfb.workspace = true
 openvnc-transport.workspace = true
+openvnc-security.workspace = true
+openvnc-protocol.workspace = true
 tokio.workspace = true
 clap.workspace = true
 png.workspace = true
@@ -24,3 +26,6 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+embed-resource = "3"
