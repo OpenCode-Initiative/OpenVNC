@@ -246,6 +246,29 @@ pub struct Identity {
     pub perms: Option<Vec<String>>,
     /// `openvnc_ask` (ticket do servidor central).
     pub ask: Option<bool>,
+    /// Chave de reuso: `iss` + `jti` quando ha `jti`; senao o SHA-256 de
+    /// `cabecalho.payload` (nunca da assinatura, que e maleavel no ES256).
+    replay_key: [u8; 32],
+}
+
+/// Chave do cache de reuso. A assinatura fica de fora: no ECDSA, `(r, s)` e
+/// `(r, n - s)` sao ambas validas, e um hash do token inteiro deixaria
+/// reapresentar o mesmo ticket com a assinatura trocada.
+fn replay_key(iss: &str, jti: Option<&str>, signed: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    match jti {
+        Some(j) => {
+            h.update(b"jti\0");
+            h.update(iss.trim_end_matches('/').as_bytes());
+            h.update(b"\0");
+            h.update(j.as_bytes());
+        }
+        None => {
+            h.update(b"msg\0");
+            h.update(signed);
+        }
+    }
+    h.finalize().into()
 }
 
 /// Verifica o JWT contra as chaves e a politica, no instante `t`.
@@ -337,12 +360,20 @@ fn verify_at(token: &str, jwks: &Jwks, p: &Policy, t: u64) -> Result<Identity, O
             .map(str::to_owned)
             .collect()
     });
+    let jti = c
+        .get("jti")
+        .and_then(Value::as_str)
+        .filter(|j| !j.is_empty() && j.len() <= 256);
     if let Some(want) = &p.machine {
         if machine.as_deref() != Some(want.as_str()) {
             return Err(bad("ticket emitido para outra maquina"));
         }
         if perms.is_none() {
             return Err(bad("ticket sem permissoes"));
+        }
+        // o servidor central sempre emite jti; sem ele nao ha reuso confiavel
+        if jti.is_none() {
+            return Err(bad("ticket sem jti"));
         }
     }
     let user = c
@@ -356,6 +387,7 @@ fn verify_at(token: &str, jwks: &Jwks, p: &Policy, t: u64) -> Result<Identity, O
         machine,
         perms,
         ask: c.get(CLAIM_ASK).and_then(Value::as_bool),
+        replay_key: replay_key(iss, jti, msg),
     })
 }
 
@@ -369,13 +401,15 @@ pub fn verify_offline(token: &str, jwks: &Jwks, p: &Policy, t: u64) -> Result<Id
 struct VerifierState {
     jwks: Jwks,
     fetched: Option<Instant>,
-    /// hash do token -> exp (recusa reuso).
+    /// chave de reuso (ver [`replay_key`]) -> exp (recusa reuso).
     seen: HashMap<[u8; 32], u64>,
 }
 
 /// Verificador do servidor (compartilhavel entre conexoes).
 pub struct Verifier {
     policy: Policy,
+    /// Vinculo por host no modo SSO generico (ver [`Verifier::require_host_binding`]).
+    host_binding: Option<String>,
     agent: ureq::Agent,
     state: Mutex<VerifierState>,
 }
@@ -384,8 +418,22 @@ impl Verifier {
     /// Cria sem rede; as chaves sao buscadas no primeiro uso.
     pub fn new(policy: Policy, ca_pem: Option<&[u8]>) -> Result<Self, Error> {
         check_url(&policy.issuer)?;
+        // vinculo por host tambem pode vir do ambiente, sem mudar a configuracao
+        let host_binding = std::env::var(ENV_HOST_BINDING)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if policy.machine.is_none() && host_binding.is_none() {
+            // sem tracing nesta crate: so stderr
+            eprintln!(
+                "aviso: SSO generico sem vinculo por host: um ID token com aud \"{}\" vale em \
+                 qualquer host com a mesma audiencia (ver docs/security.md; defina {ENV_HOST_BINDING})",
+                policy.audience
+            );
+        }
         Ok(Self {
             policy,
+            host_binding,
             agent: http_agent(ca_pem)?,
             state: Mutex::new(VerifierState {
                 jwks: Jwks::default(),
@@ -398,6 +446,16 @@ impl Verifier {
     /// Politica configurada.
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// Exige vinculo por host no modo SSO generico: o token precisa trazer
+    /// `openvnc_machine` igual a `id` ou ter `id` (ou `<audience>:<id>`)
+    /// entre os valores de `aud`. Sem isso, um token emitido para um host
+    /// pode ser reapresentado em outro que aceite a mesma audiencia.
+    pub fn require_host_binding(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.host_binding = Some(id.trim().to_owned()).filter(|s| !s.is_empty());
+        self
     }
 
     fn refresh(&self) -> Result<(), Error> {
@@ -436,13 +494,43 @@ impl Verifier {
             Some(r) => r,
         };
         let id = r.map_err(|e| e.unwrap_or_else(|| Error("chave (kid) desconhecida".into())))?;
-        let h: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        if let Some(want) = &self.host_binding {
+            if !host_bound(token, &self.policy.audience, want) {
+                return err("token sem vinculo com este host");
+            }
+        }
         let mut st = self.state.lock().unwrap();
         st.seen.retain(|_, exp| *exp + LEEWAY >= t);
-        if st.seen.insert(h, id.exp).is_some() {
+        if st.seen.insert(id.replay_key, id.exp).is_some() {
             return err("token ja usado (reuso recusado)");
         }
         Ok(id)
+    }
+}
+
+/// Variavel de ambiente com o id deste host para o vinculo por host no
+/// modo SSO generico (ver [`Verifier::require_host_binding`]).
+pub const ENV_HOST_BINDING: &str = "OPENVNC_OIDC_HOST_ID";
+
+/// O token (ja verificado) esta vinculado ao host `id`?
+fn host_bound(token: &str, audience: &str, id: &str) -> bool {
+    let Some(c) = token
+        .split('.')
+        .nth(1)
+        .and_then(|b| B64.decode(b).ok())
+        .and_then(|x| serde_json::from_slice::<Value>(&x).ok())
+    else {
+        return false;
+    };
+    if c.get(CLAIM_MACHINE).and_then(Value::as_str) == Some(id) {
+        return true;
+    }
+    let scoped = format!("{audience}:{id}");
+    let hit = |a: &str| a == id || a == scoped;
+    match c.get("aud") {
+        Some(Value::String(a)) => hit(a),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(hit),
+        _ => false,
     }
 }
 
@@ -683,6 +771,7 @@ mod tests {
         c[CLAIM_MACHINE] = "pc-01".into();
         c[CLAIM_PERMS] = serde_json::json!(["view", "control"]);
         c[CLAIM_ASK] = true.into();
+        c["jti"] = "t1".into();
         let tok = sign(&kp, h.clone(), c.clone());
         let mut p = policy();
         p.machine = Some("pc-01".into());
@@ -715,5 +804,92 @@ mod tests {
         let tok = sign(&kp, h, claims(now()));
         assert_eq!(v.verify(tok.as_bytes()).unwrap().user, "alice");
         assert!(v.verify(tok.as_bytes()).is_err());
+    }
+
+    fn verifier(p: Policy, jwks: Jwks) -> Verifier {
+        let v = Verifier::new(p, None).unwrap();
+        {
+            let mut st = v.state.lock().unwrap();
+            st.jwks = jwks;
+            st.fetched = Some(Instant::now());
+        }
+        v
+    }
+
+    /// Troca `s` por `n - s` (assinatura ES256 maleavel, ainda valida).
+    fn malleate(tok: &str) -> String {
+        // ordem do grupo P-256
+        const N: [u8; 32] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2,
+            0xFC, 0x63, 0x25, 0x51,
+        ];
+        let (m, s) = tok.rsplit_once('.').unwrap();
+        let mut sig = B64.decode(s).unwrap();
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = N[i] as i16 - sig[32 + i] as i16 - borrow;
+            borrow = (d < 0) as i16;
+            sig[32 + i] = (d + 256 * borrow) as u8;
+        }
+        format!("{m}.{}", B64.encode(sig))
+    }
+
+    #[test]
+    fn reuso_com_assinatura_maleavel_e_recusado() {
+        let (kp, jwks) = setup();
+        let h = serde_json::json!({"alg": "ES256", "kid": "k1"});
+        // sem jti (IdP generico): chave e cabecalho.payload
+        let v = verifier(policy(), jwks.clone());
+        let tok = sign(&kp, h.clone(), claims(now()));
+        let alt = malleate(&tok);
+        assert_ne!(tok, alt);
+        assert!(verify_offline(&alt, &jwks, &policy(), now()).is_ok());
+        assert!(v.verify(tok.as_bytes()).is_ok());
+        assert!(v.verify(alt.as_bytes()).is_err());
+        // com jti: chave e iss + jti, mesmo reassinado com outro payload
+        let mut c = claims(now());
+        c["jti"] = "abc".into();
+        assert!(v.verify(sign(&kp, h.clone(), c.clone()).as_bytes()).is_ok());
+        c["iat"] = (now() - 1).into();
+        assert!(v.verify(sign(&kp, h, c).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn ticket_central_exige_jti() {
+        let (kp, jwks) = setup();
+        let t = 1_800_000_000;
+        let h = serde_json::json!({"alg": "ES256", "kid": "k1"});
+        let mut c = claims(t);
+        c[CLAIM_MACHINE] = "pc-01".into();
+        c[CLAIM_PERMS] = serde_json::json!(["view"]);
+        let mut p = policy();
+        p.machine = Some("pc-01".into());
+        assert!(verify_at(&sign(&kp, h.clone(), c.clone()), &jwks, &p, t).is_err());
+        c["jti"] = "x1".into();
+        assert!(verify_at(&sign(&kp, h, c), &jwks, &p, t).is_ok());
+    }
+
+    #[test]
+    fn vinculo_por_host_no_sso_generico() {
+        let (kp, jwks) = setup();
+        let h = serde_json::json!({"alg": "ES256", "kid": "k1"});
+        let v = verifier(policy(), jwks).require_host_binding("pc-01");
+        // token generico sem vinculo: recusado
+        assert!(v
+            .verify(sign(&kp, h.clone(), claims(now())).as_bytes())
+            .is_err());
+        // claim openvnc_machine
+        let mut c = claims(now());
+        c[CLAIM_MACHINE] = "pc-01".into();
+        assert!(v.verify(sign(&kp, h.clone(), c).as_bytes()).is_ok());
+        // aud por maquina
+        let mut c = claims(now());
+        c["aud"] = serde_json::json!(["openvnc", "openvnc:pc-01"]);
+        assert!(v.verify(sign(&kp, h.clone(), c).as_bytes()).is_ok());
+        // outro host
+        let mut c = claims(now());
+        c["aud"] = serde_json::json!(["openvnc", "openvnc:pc-02"]);
+        assert!(v.verify(sign(&kp, h, c).as_bytes()).is_err());
     }
 }

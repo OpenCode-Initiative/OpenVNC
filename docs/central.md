@@ -115,13 +115,22 @@ linha da entrada padrao).
 | GET | `/api/audit?limit=N` | auditoria, so administradores |
 | POST | `/oauth/device`, `/oauth/token`; GET/POST `/device` | fluxo por codigo de dispositivo |
 
-Falhas de login seguidas geram bloqueio progressivo por usuario e por IP.
+Falhas de login seguidas geram bloqueio progressivo em tres chaves:
+
+- usuario + IP: apos `lockout_free` falhas, 30 s dobrando ate 15 min;
+- so IP (mais forte contra varredura de varios usuarios): apos 3x `lockout_free` falhas, ate 15 min; um login correto nao zera;
+- so usuario (global): apos 4x `lockout_free` falhas, no maximo 60 s, para que ninguem consiga travar a conta de outra pessoa por muito tempo.
+
+Na pagina `/device` o usuario primeiro informa o codigo; so entao ve a
+maquina alvo e o `client_id` do pedido e precisa marcar a confirmacao
+antes de aprovar. Nunca aprove um codigo que voce nao iniciou.
 
 ## Limitacoes
 
 - Sem pagina web de administracao (so a CLI).
-- O servidor da maquina nao guarda `jti` usados: um ticket pode ser
-  reaproveitado dentro da validade (curta). Mantenha `ticket_ttl` baixo.
+- O servidor da maquina guarda os `jti` usados so em memoria: apos
+  reiniciar, um ticket ainda valido poderia ser reaproveitado. Mantenha
+  `ticket_ttl` baixo.
 - `clipboard` ainda nao e aplicada (nao ha canal de area de transferencia).
 - Sessoes de login ficam em memoria: reiniciar o central encerra todas.
 

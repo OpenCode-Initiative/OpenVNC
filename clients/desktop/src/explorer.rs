@@ -1235,6 +1235,13 @@ async fn upload_file(
     }
 }
 
+/// Limites do download recursivo de pastas (protege contra servidor malicioso).
+const MAX_DEPTH: usize = 64;
+const MAX_ENTRIES: usize = 100_000;
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Prefixo dos erros que abortam o download inteiro.
+const ABORT: &str = "abortado: ";
+
 /// Baixa arquivo ou pasta. Devolve quantos itens falharam (pastas).
 async fn download(
     fs: &FsClient,
@@ -1248,13 +1255,19 @@ async fn download(
         Path::new(&spec.dst_dir).join(&spec.name),
         spec.is_dir,
         0u64,
+        0usize,
     )];
     let mut top = true;
-    while let Some((remote, local, is_dir, _size)) = stack.pop() {
+    let mut entries_seen = 0usize;
+    let mut total_bytes = 0u64;
+    while let Some((remote, local, is_dir, size, depth)) = stack.pop() {
         if cancel.load(Ordering::SeqCst) {
             return Err("cancelado".into());
         }
         if is_dir {
+            if depth >= MAX_DEPTH {
+                return Err(format!("{ABORT}pasta com mais de {MAX_DEPTH} niveis"));
+            }
             if let Err(e) = std::fs::create_dir_all(&local) {
                 if top {
                     return Err(e.to_string());
@@ -1269,8 +1282,19 @@ async fn download(
                 .await
             {
                 FsReply::Entries { entries, .. } => {
+                    entries_seen += entries.len();
+                    if entries_seen > MAX_ENTRIES {
+                        return Err(format!("{ABORT}mais de {MAX_ENTRIES} itens na pasta"));
+                    }
                     for e in entries {
                         if !e.is_dir {
+                            total_bytes = total_bytes.saturating_add(e.size);
+                            if total_bytes > MAX_TOTAL_BYTES {
+                                return Err(format!(
+                                    "{ABORT}pasta maior que {} GB",
+                                    MAX_TOTAL_BYTES / (1024 * 1024 * 1024)
+                                ));
+                            }
                             prog(e.size, 0);
                         }
                         // nomes ja validados pelo protocolo (sem separador nem ..)
@@ -1279,6 +1303,7 @@ async fn download(
                             local.join(&e.name),
                             e.is_dir,
                             e.size,
+                            depth + 1,
                         ));
                     }
                 }
@@ -1293,9 +1318,21 @@ async fn download(
             top = false;
             continue;
         }
-        let r = download_file(fs, &remote, &local, spec.overwrite, cancel, prog, top).await;
+        // arquivo dentro de pasta: nao aceita mais bytes que o tamanho anunciado
+        let limit = if top { None } else { Some(size) };
+        let r = download_file(
+            fs,
+            &remote,
+            &local,
+            spec.overwrite,
+            cancel,
+            prog,
+            top,
+            limit,
+        )
+        .await;
         if let Err(e) = r {
-            if top || e == "cancelado" {
+            if top || e == "cancelado" || e.starts_with(ABORT) {
                 return Err(e);
             }
             failed += 1;
@@ -1305,6 +1342,7 @@ async fn download(
     Ok(failed)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     fs: &FsClient,
     remote: &str,
@@ -1313,6 +1351,7 @@ async fn download_file(
     cancel: &AtomicBool,
     prog: &impl Fn(u64, u64),
     count_total: bool,
+    max_size: Option<u64>,
 ) -> Result<(), String> {
     if local.exists() && !overwrite {
         return Err(format!("{}: ja existe", local.display()));
@@ -1340,6 +1379,15 @@ async fn download_file(
             .await
         {
             FsReply::Data { data, eof } => {
+                if let Some(max) = max_size {
+                    if offset.saturating_add(data.len() as u64) > max {
+                        drop(f);
+                        return fail(
+                            local,
+                            format!("{ABORT}{remote}: servidor enviou mais bytes que o anunciado"),
+                        );
+                    }
+                }
                 if let Err(e) = f.write_all(&data) {
                     drop(f);
                     return fail(local, e.to_string());

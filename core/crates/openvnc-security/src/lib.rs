@@ -3,6 +3,8 @@
 //! **VNC Authentication (tipo 2) e insegura**: DES com chave de 56 bits
 //! derivada de no maximo 8 caracteres e trafego sem criptografia. Existe
 //! apenas por compatibilidade e a UI deve sinalizar isso ao usuario.
+//! Deve ficar **desligada por padrao** em toda configuracao que a ofereca;
+//! so ligue para clientes VNC legados em rede confiavel.
 
 pub mod audit;
 pub mod central;
@@ -39,6 +41,9 @@ impl std::fmt::Debug for Password {
 }
 
 /// Resposta ao desafio de 16 bytes da VNC Authentication.
+///
+/// **Inseguro**: DES de 56 bits, so 8 caracteres de senha, sem cifra do
+/// trafego. Use apenas quando o legado for habilitado explicitamente.
 ///
 /// A chave e a senha (truncada/preenchida com zeros ate 8 bytes) com os
 /// bits de cada byte invertidos, conforme implementacoes historicas.

@@ -8,7 +8,7 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 5 {
         return;
     }
-    let enc = [encoding::RAW, encoding::COPY_RECT, encoding::HEXTILE, encoding::ZRLE][usize::from(data[0] % 4)];
+    let enc = [encoding::RAW, encoding::COPY_RECT, encoding::HEXTILE, encoding::ZRLE, encoding::TIGHT][usize::from(data[0] % 5)];
     let rect = Rect { x: u16::from(data[1] % 32), y: u16::from(data[2] % 32), width: u16::from(data[3] % 80), height: u16::from(data[4] % 80) };
     let mut fb = Framebuffer::new(64, 64, 1 << 20).unwrap();
     let mut st = CodecState::default();

@@ -86,7 +86,7 @@ fn decode_jpeg(r: Rect, data: &[u8], fb: &mut Framebuffer) -> Result<()> {
         return Err(Error::Protocol("tight jpeg: tamanho incorreto".into()));
     }
     for (i, row) in rgba.chunks_exact(w.max(1)).enumerate() {
-        fb.put_rgba_row(r.x, r.y + i as u16, row);
+        fb.put_rgba_row(r.x, r.y.saturating_add(i as u16), row);
     }
     Ok(())
 }
@@ -209,13 +209,21 @@ pub(crate) fn decode_tight(
     if raw_len < 12 {
         reset(st, ctl);
     }
+    if w == 0 || h == 0 {
+        // Retangulo vazio: os bytes ja foram consumidos, nada a desenhar
+        // (evita `chunks_exact(0)`, que entra em panico).
+        return Ok(Progress {
+            consumed: p,
+            done: true,
+        });
+    }
     let mut row: Vec<[u8; 4]> = Vec::with_capacity(w);
     match filter {
         0 => {
             for (y, line) in data.chunks_exact(w * cpx).enumerate() {
                 row.clear();
                 row.extend(line.chunks_exact(cpx).map(px));
-                fb.put_rgba_row(r.x, r.y + y as u16, &row);
+                fb.put_rgba_row(r.x, r.y.saturating_add(y as u16), &row);
             }
         }
         1 => {
@@ -231,7 +239,7 @@ pub(crate) fn decode_tight(
                     for x in 0..w {
                         row.push(get((line[x / 8] >> (7 - x % 8)) & 1)?);
                     }
-                    fb.put_rgba_row(r.x, r.y + y as u16, &row);
+                    fb.put_rgba_row(r.x, r.y.saturating_add(y as u16), &row);
                 }
             } else {
                 for (y, line) in data.chunks_exact(w).enumerate() {
@@ -239,7 +247,7 @@ pub(crate) fn decode_tight(
                     for &i in line {
                         row.push(get(i)?);
                     }
-                    fb.put_rgba_row(r.x, r.y + y as u16, &row);
+                    fb.put_rgba_row(r.x, r.y.saturating_add(y as u16), &row);
                 }
             }
         }
@@ -286,7 +294,7 @@ fn gradient(r: Rect, data: &[u8], pf: &PixelFormat, cpx: usize, fb: &mut Framebu
                 (c[0] as u32) << shift[0] | (c[1] as u32) << shift[1] | (c[2] as u32) << shift[2];
             row.push(pf.to_rgba(p));
         }
-        fb.put_rgba_row(r.x, r.y + y as u16, &row);
+        fb.put_rgba_row(r.x, r.y.saturating_add(y as u16), &row);
         std::mem::swap(&mut prev, &mut cur);
     }
 }
@@ -349,6 +357,27 @@ mod tests {
             assert_eq!(compact_len(&v), Some((n, v.len())), "{n}");
         }
         assert_eq!(compact_len(&[0x80]), None);
+    }
+
+    #[test]
+    fn retangulo_vazio_nao_entra_em_panico() {
+        // copy (0x00), paleta de 2 cores e paleta de 3 cores (0x40, filtro 1)
+        for (r, bytes) in [
+            (Rect::new(0, 0, 0, 5), vec![0x00]),
+            (Rect::new(0, 0, 5, 0), vec![0x00]),
+            (Rect::new(0, 0, 0, 5), vec![0x40, 1, 1, 1, 1, 1, 2, 2, 2]),
+            (
+                Rect::new(0, 0, 0, 5),
+                vec![0x40, 1, 2, 1, 1, 1, 2, 2, 2, 3, 3, 3],
+            ),
+        ] {
+            let mut f = fb();
+            let mut st = CodecState::default();
+            let mut d = RectDecoder::new(r, encoding::TIGHT).unwrap();
+            let p = d.decode(&bytes, &PF, &mut f, &mut st).unwrap();
+            assert!(p.done, "{r:?}");
+            assert_eq!(p.consumed, bytes.len(), "{r:?}");
+        }
     }
 
     #[test]

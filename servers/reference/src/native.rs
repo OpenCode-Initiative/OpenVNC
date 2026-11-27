@@ -110,7 +110,12 @@ impl Video {
     }
 }
 
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Payload maximo aceito antes da autenticacao (limita memoria de
+/// clientes anonimos).
+const PREAUTH_MAX_PAYLOAD: u32 = 64 * 1024;
+
+/// Liga o limite normal de payload depois da autenticacao.
+type AuthFlag = Arc<std::sync::atomic::AtomicBool>;
 
 /// Listeners nativos ja ligados.
 pub struct Listeners {
@@ -178,25 +183,34 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
             let acc = acceptor.clone();
             let sh = sh2.clone();
             tokio::spawn(async move {
-                let Some(_slot) = Slot::take(&sh, &peer.to_string()) else {
+                // prazo unico: TLS + handshake + autenticacao
+                let deadline = tokio::time::Instant::now() + crate::AUTH_TIMEOUT;
+                let Some(_slot) = Slot::take(&sh, &peer.to_string(), peer.ip()) else {
                     return;
                 };
-                let tls = match acc.accept(sock).await {
-                    Ok(s) => s,
-                    Err(e) => {
+                let tls = match tokio::time::timeout_at(deadline, acc.accept(sock)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         tracing::info!(%peer, "TLS nativo falhou: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!(%peer, "TLS nativo: timeout");
                         return;
                     }
                 };
                 let (r, w) = tokio::io::split(tls);
                 let (in_tx, in_rx) = mpsc::channel(256);
                 let (out_tx, out_rx) = mpsc::channel(64);
-                tokio::spawn(reader(r, in_tx));
+                let authed = AuthFlag::default();
+                tokio::spawn(reader(r, in_tx, authed.clone()));
                 let wt = tokio::spawn(writer(w, out_rx));
                 run_session(
                     &sh,
                     &peer.to_string(),
                     "tcp-tls",
+                    deadline,
+                    &authed,
                     in_rx,
                     out_tx.clone(),
                     out_tx,
@@ -237,19 +251,24 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
                     .close(5u32.into(), b"bloqueado temporariamente");
                 return;
             }
-            let Some(_slot) = Slot::take(&sh, &peer) else {
+            let deadline = tokio::time::Instant::now() + crate::AUTH_TIMEOUT;
+            let Some(_slot) = Slot::take(&sh, &peer, addr.ip()) else {
                 s.connection.close(4u32.into(), b"limite de clientes");
                 return;
             };
             let (in_tx, in_rx) = mpsc::channel(256);
             let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
             let (gfx_tx, gfx_rx) = mpsc::channel(8);
-            tokio::spawn(reader(s.control.recv, in_tx.clone()));
-            tokio::spawn(reader(s.input.recv, in_tx.clone()));
-            tokio::spawn(reader(s.graphics.recv, in_tx));
+            let authed = AuthFlag::default();
+            tokio::spawn(reader(s.control.recv, in_tx.clone(), authed.clone()));
+            tokio::spawn(reader(s.input.recv, in_tx.clone(), authed.clone()));
+            tokio::spawn(reader(s.graphics.recv, in_tx, authed.clone()));
             let wc = tokio::spawn(writer(s.control.send, ctrl_rx));
             let wg = tokio::spawn(writer(s.graphics.send, gfx_rx));
-            run_session(&sh, &peer, "quic", in_rx, ctrl_tx, gfx_tx).await;
+            run_session(
+                &sh, &peer, "quic", deadline, &authed, in_rx, ctrl_tx, gfx_tx,
+            )
+            .await;
             let _ = wc.await;
             let _ = wg.await;
             s.connection.close(0u32.into(), b"fim");
@@ -258,11 +277,18 @@ pub async fn serve(l: Listeners, sh: Arc<Shared>) {
     tcp_task.abort();
 }
 
-/// Reserva uma vaga no limite de clientes; libera no drop.
-struct Slot<'a>(&'a Shared);
+/// Reserva uma vaga no limite de clientes e no limite por IP; libera no
+/// drop.
+struct Slot<'a>(&'a Shared, #[allow(dead_code)] crate::IpSlot);
 
 impl<'a> Slot<'a> {
-    fn take(sh: &'a Shared, peer: &str) -> Option<Self> {
+    fn take(sh: &'a Shared, peer: &str, ip: std::net::IpAddr) -> Option<Self> {
+        let Some(ip_slot) = sh.per_ip.take(ip) else {
+            tracing::warn!(%peer, "limite de conexoes por IP; recusado (nativo)");
+            sh.audit
+                .record("rejected", &[("peer", peer), ("reason", "max_per_ip")]);
+            return None;
+        };
         if sh.clients.fetch_add(1, Ordering::SeqCst) >= sh.cfg.max_clients {
             sh.clients.fetch_sub(1, Ordering::SeqCst);
             tracing::warn!(%peer, "limite de clientes; recusado (nativo)");
@@ -271,7 +297,7 @@ impl<'a> Slot<'a> {
             return None;
         }
         crate::tray::CLIENTS.fetch_add(1, Ordering::Relaxed);
-        Some(Slot(sh))
+        Some(Slot(sh, ip_slot))
     }
 }
 
@@ -282,8 +308,25 @@ impl Drop for Slot<'_> {
     }
 }
 
-async fn reader<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<Message>) {
-    while let Ok(m) = read_message(&mut r, DEFAULT_MAX_PAYLOAD).await {
+async fn reader<R: AsyncRead + Unpin>(r: R, tx: mpsc::Sender<Message>, authed: AuthFlag) {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut r = tokio::io::BufReader::new(r);
+    loop {
+        // espera chegar dado antes de escolher o limite: o quadro que vem
+        // logo apos o AuthResult ja usa o limite normal
+        match r.fill_buf().await {
+            Ok([]) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // antes de autenticar so aceita quadros pequenos
+        let max = if authed.load(Ordering::Acquire) {
+            DEFAULT_MAX_PAYLOAD
+        } else {
+            PREAUTH_MAX_PAYLOAD
+        };
+        let Ok(m) = read_message(&mut r, max).await else {
+            break;
+        };
         if tx.send(m).await.is_err() {
             break;
         }
@@ -302,10 +345,13 @@ async fn writer<W: AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::Receiver<Message>
     let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     sh: &Shared,
     peer: &str,
     transport: &str,
+    deadline: tokio::time::Instant,
+    authed: &AuthFlag,
     inbox: mpsc::Receiver<Message>,
     ctrl: mpsc::Sender<Message>,
     gfx: mpsc::Sender<Message>,
@@ -313,7 +359,7 @@ async fn run_session(
     tracing::info!(%peer, transport, "nativo: conectado");
     sh.audit
         .record("connect", &[("peer", peer), ("transport", transport)]);
-    match session(sh, peer, inbox, &ctrl, &gfx).await {
+    match session(sh, peer, deadline, authed, inbox, &ctrl, &gfx).await {
         Ok(()) => {
             tracing::info!(%peer, "nativo: desconectado");
             sh.audit.record("disconnect", &[("peer", peer)]);
@@ -483,6 +529,7 @@ async fn handshake(
     peer: &str,
     inbox: &mut mpsc::Receiver<Message>,
     ctrl: &mpsc::Sender<Message>,
+    authed: &AuthFlag,
 ) -> anyhow::Result<(Vec<u32>, bool, String, SessionPerms)> {
     let Some(Message::ClientHello {
         min_version,
@@ -582,6 +629,8 @@ async fn handshake(
     };
     sh.audit
         .record("auth_ok", &[("peer", peer), ("user", &user)]);
+    // libera quadros grandes antes de o cliente saber do sucesso
+    authed.store(true, Ordering::Release);
     if let Some(ip) = crate::lockout::peer_ip(peer) {
         sh.lockout.success(ip);
     }
@@ -596,12 +645,14 @@ async fn handshake(
 async fn session(
     sh: &Shared,
     peer: &str,
+    deadline: tokio::time::Instant,
+    authed: &AuthFlag,
     mut inbox: mpsc::Receiver<Message>,
     ctrl: &mpsc::Sender<Message>,
     gfx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
     let (caps, no_auth, user, perms) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(sh, peer, &mut inbox, ctrl))
+        tokio::time::timeout_at(deadline, handshake(sh, peer, &mut inbox, ctrl, authed))
             .await
             .map_err(|_| anyhow::anyhow!("timeout no handshake"))??;
     // sem credencial, so com autorizacao local (allow_attended)
@@ -625,7 +676,7 @@ async fn session(
         None => sh.cfg.ask_before_accept,
     } || (no_auth && !sh.cfg.allow_no_auth);
     let approval = if ask {
-        crate::tray::ask_once(&user, peer).await
+        crate::tray::ask_once(&user, peer, !no_auth).await
     } else {
         None
     };

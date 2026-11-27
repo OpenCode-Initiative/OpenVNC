@@ -136,8 +136,50 @@ fn bytes_sobrando_e_tipo_desconhecido() {
 }
 
 #[test]
+fn nome_de_arquivo_valido() {
+    for n in [
+        "relatorio.pdf",
+        "console.txt",
+        "com10",
+        "lpt",
+        "nul_x",
+        ".bashrc",
+        "a b.txt",
+        "COMx",
+    ] {
+        assert_eq!(sanitize_file_name(n).unwrap(), n);
+    }
+}
+
+#[test]
 fn nome_de_arquivo_perigoso() {
-    for n in ["../x", "a/b", "c:x", "a\\b", "", "..", "a\nb"] {
+    for n in [
+        "../x",
+        "a/b",
+        "c:x",
+        "a\\b",
+        "",
+        "..",
+        "a\nb",
+        "CON",
+        "con",
+        "Nul.txt",
+        "aux.tar.gz",
+        "PRN ",
+        "com1",
+        "COM9.log",
+        "lpt0",
+        "LPT\u{b9}.txt",
+        "nul .txt",
+        "a.",
+        "a ",
+        "a<b",
+        "a>b",
+        "a\"b",
+        "a|b",
+        "a?b",
+        "a*b",
+    ] {
         assert!(sanitize_file_name(n).is_err(), "{n}");
     }
     let m = Message::FileOffer {

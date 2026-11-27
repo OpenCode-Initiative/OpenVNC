@@ -10,6 +10,10 @@
 //! - criacoes (mkdir, upload, destino de rename) canonicalizam o **pai** e
 //!   validam o nome final; destinos que ja sao links nao sao seguidos;
 //! - apagar nunca segue links: remove o proprio link.
+//! - sem `files_root`, a raiz padrao e a pasta do usuario (USERPROFILE/HOME),
+//!   nunca o disco todo;
+//! - escrita/apagar e sempre negada em pastas do sistema (ProgramData\OpenVNC,
+//!   Program Files, Windows, pasta de instalacao), mesmo que a raiz as inclua.
 //!
 //! Permissoes: listar e baixar exigem `files_send`; enviar, criar pasta,
 //! renomear e apagar exigem `files_receive`. Ambos so valem se a sessao
@@ -22,8 +26,10 @@ use std::path::{Component, Path, PathBuf};
 
 /// Estado do explorador numa sessao.
 pub struct Explorer {
-    /// Raiz canonica (None = disco todo).
+    /// Raiz canonica (None = disco todo; so acontece sem pasta do usuario).
     root: Option<PathBuf>,
+    /// Pastas canonicas onde escrita/apagar sao sempre negados.
+    protected: Vec<PathBuf>,
     read_ok: bool,
     write_ok: bool,
     /// Tamanho maximo de arquivo enviado pelo cliente.
@@ -46,6 +52,20 @@ impl Explorer {
 
     /// Construtor explicito (testes).
     pub fn with(root: Option<&Path>, read_ok: bool, write_ok: bool, max_file: u64) -> Self {
+        Explorer::with_protected(root, read_ok, write_ok, max_file, protected_dirs())
+    }
+
+    /// Construtor com lista explicita de pastas protegidas (testes).
+    pub fn with_protected(
+        root: Option<&Path>,
+        read_ok: bool,
+        write_ok: bool,
+        max_file: u64,
+        protected: Vec<PathBuf>,
+    ) -> Self {
+        // sem raiz configurada, usa a pasta do usuario em vez do disco todo
+        let home = if root.is_none() { home_dir() } else { None };
+        let root = root.or(home.as_deref());
         // raiz invalida (inexistente) desliga o explorador: nunca cai para
         // o disco todo por engano
         let (root, ok) = match root {
@@ -55,8 +75,13 @@ impl Explorer {
             },
             None => (None, true),
         };
+        let protected = protected
+            .into_iter()
+            .filter_map(|p| fs::canonicalize(p).ok())
+            .collect();
         Explorer {
             root,
+            protected,
             read_ok: read_ok && ok,
             write_ok: write_ok && ok,
             max_file,
@@ -167,6 +192,14 @@ impl Explorer {
         }
     }
 
+    /// Nega escrita/apagar em pastas do sistema, qualquer que seja a raiz.
+    fn writable(&self, canonical: &Path) -> Res<()> {
+        if self.protected.iter().any(|b| path_under(canonical, b)) {
+            return Err("pasta protegida pelo servidor: escrita negada".into());
+        }
+        Ok(())
+    }
+
     fn is_root(&self, p: &Path) -> bool {
         self.root.as_deref() == Some(p) || p.parent().is_none()
     }
@@ -232,6 +265,7 @@ impl Explorer {
 
     fn mkdir(&self, raw: &str) -> Res<FsReply> {
         let p = self.resolve_new(raw)?;
+        self.writable(&p)?;
         fs::create_dir(&p).map_err(|e| format!("{raw}: {e}"))?;
         Ok(FsReply::Ok)
     }
@@ -239,6 +273,7 @@ impl Explorer {
     fn rename(&self, from: &str, to: &str) -> Res<FsReply> {
         // a origem nao e seguida: renomear um link renomeia o link
         let src = self.resolve_new(from)?;
+        self.writable(&src)?;
         if fs::symlink_metadata(&src).is_err() {
             return Err(format!("{from}: nao existe"));
         }
@@ -246,6 +281,7 @@ impl Explorer {
             return Err("nao e permitido renomear a raiz".into());
         }
         let dst = self.resolve_new(to)?;
+        self.writable(&dst)?;
         if fs::symlink_metadata(&dst).is_ok() {
             return Err(format!("{to}: ja existe"));
         }
@@ -259,6 +295,7 @@ impl Explorer {
 
     fn delete(&self, raw: &str) -> Res<FsReply> {
         let p = self.resolve_new(raw)?;
+        self.writable(&p)?;
         if self.is_root(&p) {
             return Err("nao e permitido apagar a raiz".into());
         }
@@ -285,6 +322,7 @@ impl Explorer {
             ));
         }
         let p = self.resolve_new(raw)?;
+        self.writable(&p)?;
         if let Ok(m) = fs::symlink_metadata(&p) {
             if m.file_type().is_symlink() {
                 return Err(format!("{raw}: e um link; nao sera seguido"));
@@ -319,6 +357,61 @@ impl Explorer {
         f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
         f.write_all(data).map_err(|e| format!("{raw}: {e}"))?;
         Ok(FsReply::Ok)
+    }
+}
+
+/// Pasta do usuario canonica (USERPROFILE no Windows, HOME nos demais).
+fn home_dir() -> Option<PathBuf> {
+    let h = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    fs::canonicalize(h).ok().filter(|c| c.is_dir())
+}
+
+/// Pastas do sistema onde o explorador nunca escreve.
+fn protected_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(pd) = std::env::var_os("ProgramData") {
+        v.push(PathBuf::from(pd).join("OpenVNC"));
+    }
+    for k in [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "WINDIR",
+        "SystemRoot",
+    ] {
+        if let Some(d) = std::env::var_os(k) {
+            v.push(PathBuf::from(d));
+        }
+    }
+    // pasta de instalacao (onde esta o executavel)
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        v.push(dir);
+    }
+    v
+}
+
+/// `p` esta dentro de `base` (ambos canonicos). No Windows a comparacao
+/// ignora maiusculas/minusculas.
+fn path_under(p: &Path, base: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut pc = p.components();
+        for b in base.components() {
+            match pc.next() {
+                Some(c)
+                    if c.as_os_str().to_string_lossy().to_lowercase()
+                        == b.as_os_str().to_string_lossy().to_lowercase() => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        p.starts_with(base)
     }
 }
 
@@ -674,5 +767,68 @@ mod tests {
         assert_eq!(x.handle(&FsOp::Delete { path: s(&link) }), FsReply::Ok);
         assert!(out.join("segredo.txt").exists());
         assert!(fs::symlink_metadata(&link).is_err());
+    }
+
+    #[test]
+    fn pasta_protegida_nega_escrita() {
+        let (_t, root, _out) = setup();
+        let prot = root.join("sub");
+        let x = Explorer::with_protected(Some(&root), true, true, 1 << 20, vec![prot.clone()]);
+        // leitura continua permitida
+        assert!(matches!(
+            x.handle(&FsOp::List { path: s(&prot) }),
+            FsReply::Entries { .. }
+        ));
+        err(x.handle(&FsOp::Write {
+            path: s(&prot.join("x.bin")),
+            offset: 0,
+            overwrite: true,
+            data: b"x".to_vec(),
+        }));
+        err(x.handle(&FsOp::Mkdir {
+            path: s(&prot.join("d")),
+        }));
+        err(x.handle(&FsOp::Delete { path: s(&prot) }));
+        err(x.handle(&FsOp::Rename {
+            from: s(&root.join("a.txt")),
+            to: s(&prot.join("a.txt")),
+        }));
+        assert!(root.join("a.txt").exists());
+        assert!(!prot.join("x.bin").exists());
+        // fora da pasta protegida segue normal
+        assert_eq!(
+            x.handle(&FsOp::Mkdir {
+                path: s(&root.join("livre"))
+            }),
+            FsReply::Ok
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pasta_protegida_ignora_caixa() {
+        let (_t, root, _out) = setup();
+        let up = PathBuf::from(s(&root.join("sub")).to_uppercase());
+        let x = Explorer::with_protected(Some(&root), true, true, 1 << 20, vec![up]);
+        err(x.handle(&FsOp::Mkdir {
+            path: s(&root.join("sub").join("d")),
+        }));
+        assert!(path_under(
+            Path::new(r"C:\Windows\System32"),
+            Path::new(r"c:\windows")
+        ));
+        assert!(!path_under(
+            Path::new(r"C:\Windows2"),
+            Path::new(r"C:\Windows")
+        ));
+    }
+
+    #[test]
+    fn sem_raiz_usa_pasta_do_usuario() {
+        let x = Explorer::with(None, true, false, 1);
+        if let Some(h) = home_dir() {
+            assert_eq!(x.root.as_deref(), Some(h.as_path()));
+            assert_eq!(x.roots(), vec![display(&h)]);
+        }
     }
 }

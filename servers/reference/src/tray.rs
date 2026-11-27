@@ -69,24 +69,27 @@ pub async fn ask_accept(peer: &str) -> bool {
     matches!(task.await, Ok(true))
 }
 
-/// Sessoes aprovadas em andamento, por IP. O cliente abre duas conexoes
-/// (tela RFB e canal nativo de arquivos); com isto o usuario local aprova
-/// uma vez so: a segunda conexao do mesmo IP aproveita a aprovacao enquanto
-/// a primeira estiver aberta.
-static APPROVED: std::sync::Mutex<Vec<(std::net::IpAddr, usize)>> =
+/// Sessoes aprovadas em andamento, por IP e identidade autenticada. O
+/// cliente abre duas conexoes (tela RFB e canal nativo de arquivos); com
+/// isto o usuario local aprova uma vez so: a segunda conexao do mesmo IP e
+/// da mesma identidade aproveita a aprovacao enquanto a primeira estiver
+/// aberta. Sessoes sem autenticacao nunca entram aqui nem aproveitam nada.
+static APPROVED: std::sync::Mutex<Vec<(std::net::IpAddr, String, usize)>> =
     std::sync::Mutex::new(Vec::new());
-/// Uma pergunta por vez: a segunda conexao espera a resposta da primeira.
-static ASKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// IPs com pergunta aberta na tela (no maximo uma por IP).
+static PENDING: std::sync::Mutex<Vec<std::net::IpAddr>> = std::sync::Mutex::new(Vec::new());
+/// Perguntas abertas ao mesmo tempo; acima disso recusa na hora.
+const MAX_PENDING: usize = 3;
 
 /// Aprovacao valida enquanto a sessao existir.
-pub struct Approval(Option<std::net::IpAddr>);
+pub struct Approval(Option<(std::net::IpAddr, String)>);
 
 impl Drop for Approval {
     fn drop(&mut self) {
-        if let (Some(ip), Ok(mut v)) = (self.0, APPROVED.lock()) {
-            if let Some(i) = v.iter().position(|(a, _)| *a == ip) {
-                v[i].1 -= 1;
-                if v[i].1 == 0 {
+        if let (Some((ip, id)), Ok(mut v)) = (self.0.take(), APPROVED.lock()) {
+            if let Some(i) = v.iter().position(|(a, u, _)| *a == ip && *u == id) {
+                v[i].2 -= 1;
+                if v[i].2 == 0 {
                     v.remove(i);
                 }
             }
@@ -94,33 +97,117 @@ impl Drop for Approval {
     }
 }
 
-fn hold(ip: std::net::IpAddr) -> Approval {
+fn hold(ip: std::net::IpAddr, id: String) -> Approval {
     if let Ok(mut v) = APPROVED.lock() {
-        match v.iter_mut().find(|(a, _)| *a == ip) {
-            Some(e) => e.1 += 1,
-            None => v.push((ip, 1)),
+        match v.iter_mut().find(|(a, u, _)| *a == ip && *u == id) {
+            Some(e) => e.2 += 1,
+            None => v.push((ip, id.clone(), 1)),
         }
     }
-    Approval(Some(ip))
+    Approval(Some((ip, id)))
+}
+
+/// Identidade usada para casar sessoes: usuario sem espacos; senha unica
+/// (sem usuario nomeado) vira "".
+fn identity(user: &str) -> String {
+    let u = user.trim();
+    if u == crate::config::REMOTE_USER {
+        String::new()
+    } else {
+        u.to_string()
+    }
+}
+
+fn approved(ip: std::net::IpAddr, id: &str) -> bool {
+    APPROVED
+        .lock()
+        .map(|v| v.iter().any(|(a, u, n)| *a == ip && u == id && *n > 0))
+        .unwrap_or(false)
+}
+
+/// Reserva a vaga de pergunta do IP; libera no drop.
+struct PendingSlot(std::net::IpAddr);
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        if let Ok(mut v) = PENDING.lock() {
+            if let Some(i) = v.iter().position(|a| *a == self.0) {
+                v.remove(i);
+            }
+        }
+    }
+}
+
+enum Reserve {
+    Ok(PendingSlot),
+    /// Ja ha pergunta aberta para este IP.
+    Busy,
+    /// Perguntas demais abertas.
+    Full,
+}
+
+fn reserve(ip: std::net::IpAddr) -> Reserve {
+    let Ok(mut v) = PENDING.lock() else {
+        return Reserve::Full;
+    };
+    if v.contains(&ip) {
+        return Reserve::Busy;
+    }
+    if v.len() >= MAX_PENDING {
+        return Reserve::Full;
+    }
+    v.push(ip);
+    Reserve::Ok(PendingSlot(ip))
+}
+
+/// Texto da pergunta: sempre mostra o endereco e o usuario (ou a falta
+/// dele).
+fn prompt_label(user: &str, peer: &str, authenticated: bool) -> String {
+    let base = who_label(user, peer);
+    if !authenticated {
+        format!("{base} (SEM autenticacao)")
+    } else if identity(user).is_empty() {
+        format!("{base} (senha do servidor, sem usuario)")
+    } else {
+        base
+    }
 }
 
 /// Como `ask_accept`, mas sem perguntar de novo se ja ha sessao aprovada
-/// do mesmo IP. `None` = recusado.
-pub async fn ask_once(user: &str, peer: &str) -> Option<Approval> {
+/// do mesmo IP e da mesma identidade autenticada. `None` = recusado.
+pub async fn ask_once(user: &str, peer: &str, authenticated: bool) -> Option<Approval> {
+    let label = prompt_label(user, peer, authenticated);
     let Some(ip) = crate::lockout::peer_ip(peer) else {
-        return ask_accept(&who_label(user, peer))
-            .await
-            .then_some(Approval(None));
+        return ask_accept(&label).await.then_some(Approval(None));
     };
-    let _turn = ASKING.lock().await;
-    let known = APPROVED
-        .lock()
-        .map(|v| v.iter().any(|(a, n)| *a == ip && *n > 0))
-        .unwrap_or(false);
-    if known || ask_accept(&who_label(user, peer)).await {
-        Some(hold(ip))
-    } else {
-        None
+    let id = identity(user);
+    let deadline = tokio::time::Instant::now() + ASK_TIMEOUT + Duration::from_secs(5);
+    let slot = loop {
+        if authenticated && approved(ip, &id) {
+            return Some(hold(ip, id));
+        }
+        match reserve(ip) {
+            Reserve::Ok(s) => break s,
+            Reserve::Full => {
+                tracing::warn!(peer, "perguntas pendentes demais; recusado");
+                return None;
+            }
+            // outra conexao do mesmo IP esta perguntando: espera a resposta
+            // e so entao decide (aproveita se for a mesma identidade)
+            Reserve::Busy => {
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    let ok = ask_accept(&label).await;
+    drop(slot);
+    match (ok, authenticated) {
+        (true, true) => Some(hold(ip, id)),
+        (true, false) => Some(Approval(None)),
+        (false, _) => None,
     }
 }
 
@@ -469,11 +556,11 @@ mod imp {
     /// recusa.
     pub fn ask(peer: &str, timeout: Duration) -> bool {
         // texto vem da rede (usuario e endereco): so letras/digitos ASCII e
-        // `.:[]@_- `; nada de aspas, barra invertida ou `$` (vai para o
+        // `.:[]@_-() `; nada de aspas, barra invertida ou `$` (vai para o
         // osascript/zenity)
         let peer: String = peer
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || ".:[]@_- ".contains(*c))
+            .filter(|c| c.is_ascii_alphanumeric() || ".:[]@_-() ".contains(*c))
             .take(128)
             .collect();
         let msg = format!("{peer} quer acessar este computador pelo OpenVNC. Permitir?");
@@ -562,5 +649,42 @@ mod who_tests {
         assert_eq!(who_label(crate::config::REMOTE_USER, "p"), "p");
         assert_eq!(who_label("a\nb", "p"), "ab de p");
         assert_eq!(who_label(&"x".repeat(200), "p").len(), 64 + " de p".len());
+    }
+
+    #[test]
+    fn rotulo_da_pergunta() {
+        assert!(super::prompt_label("", "1.2.3.4:5", false).contains("SEM autenticacao"));
+        assert!(super::prompt_label("", "1.2.3.4:5", true).contains("1.2.3.4:5"));
+        assert_eq!(
+            super::prompt_label("ana", "1.2.3.4:5", true),
+            "ana de 1.2.3.4:5"
+        );
+    }
+
+    #[test]
+    fn aprovacao_so_para_mesma_identidade() {
+        let ip: std::net::IpAddr = "10.9.8.7".parse().unwrap();
+        let a = super::hold(ip, super::identity("ana"));
+        assert!(super::approved(ip, "ana"));
+        assert!(!super::approved(ip, "bob"));
+        assert!(!super::approved(ip, ""));
+        assert_eq!(super::identity(crate::config::REMOTE_USER), "");
+        drop(a);
+        assert!(!super::approved(ip, "ana"));
+    }
+
+    #[test]
+    fn uma_pergunta_por_ip_e_limite_total() {
+        let ips: Vec<std::net::IpAddr> = (1..=4)
+            .map(|i| format!("10.77.0.{i}").parse().unwrap())
+            .collect();
+        let s0 = super::reserve(ips[0]);
+        assert!(matches!(s0, super::Reserve::Ok(_)));
+        assert!(matches!(super::reserve(ips[0]), super::Reserve::Busy));
+        let s1 = super::reserve(ips[1]);
+        let s2 = super::reserve(ips[2]);
+        assert!(matches!(super::reserve(ips[3]), super::Reserve::Full));
+        drop((s0, s1, s2));
+        assert!(matches!(super::reserve(ips[3]), super::Reserve::Ok(_)));
     }
 }

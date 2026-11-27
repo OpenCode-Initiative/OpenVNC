@@ -40,7 +40,8 @@ pub struct ServerConfig {
     pub allow_no_auth: bool,
     /// Nome do desktop.
     pub name: String,
-    /// Desafio VNC Auth (16 bytes aleatorios do chamador).
+    /// Desafio VNC Auth (16 bytes). Se ficar zerado (padrao), o servidor
+    /// sorteia um desafio aleatorio (OsRng) a cada sessao.
     pub challenge: [u8; 16],
     /// Limite de texto de clipboard (bytes).
     pub max_cut_text: u32,
@@ -147,7 +148,11 @@ pub struct Server {
 impl Server {
     /// Cria o servidor e ja enfileira o banner `RFB 003.008`.
     /// Falha se nao houver senha nem `allow_no_auth`.
-    pub fn new(cfg: ServerConfig, width: u16, height: u16) -> Result<Self> {
+    pub fn new(mut cfg: ServerConfig, width: u16, height: u16) -> Result<Self> {
+        if cfg.challenge == [0; 16] {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut cfg.challenge);
+        }
         if cfg.require_tls && !cfg.vencrypt {
             return Err(Error::Protocol("require_tls exige vencrypt".into()));
         }

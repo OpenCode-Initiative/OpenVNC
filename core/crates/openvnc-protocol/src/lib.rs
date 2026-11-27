@@ -875,16 +875,42 @@ pub fn decode_payload(ty: u16, payload: &[u8]) -> Result<Message> {
 }
 
 /// Recusa nomes de arquivo com diretorios, `..`, vazios ou com controle.
+/// Tambem recusa, em qualquer plataforma, nomes que o Windows trata de forma
+/// especial: dispositivos reservados (`CON`, `NUL`, `COM1`, `LPT1`...,
+/// com ou sem extensao), nomes terminados em `.` ou espaco e os caracteres
+/// `<>"|?*`.
 pub fn sanitize_file_name(name: &str) -> Result<String> {
     let bad = name.is_empty()
         || name == "."
         || name == ".."
-        || name.contains(['/', '\\', ':'])
-        || name.chars().any(char::is_control);
+        || name.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*'])
+        || name.chars().any(char::is_control)
+        || name.ends_with(['.', ' '])
+        || is_windows_reserved(name);
     if bad {
         return Err(Error::Protocol("nome de arquivo invalido".into()));
     }
     Ok(name.to_string())
+}
+
+/// Nome de dispositivo reservado do Windows (ignora maiusculas, extensao e
+/// espacos antes do ponto, como o proprio Windows faz).
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let up = stem.to_uppercase();
+    if matches!(
+        up.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut it = up.chars();
+    let prefix: String = it.by_ref().take(3).collect();
+    if prefix != "COM" && prefix != "LPT" {
+        return false;
+    }
+    let rest: Vec<char> = it.collect();
+    matches!(rest.as_slice(), [c] if c.is_ascii_digit() || matches!(c, '\u{b9}' | '\u{b2}' | '\u{b3}'))
 }
 
 /// Decodificador incremental (sans-IO).

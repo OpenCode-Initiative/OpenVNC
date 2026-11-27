@@ -11,8 +11,17 @@ pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R, max_payload: u32) -> 
     let mut hb = [0u8; HEADER_LEN];
     r.read_exact(&mut hb).await?;
     let h = parse_header(&hb, max_payload)?;
-    let mut payload = vec![0u8; h.length as usize];
-    r.read_exact(&mut payload).await?;
+    // Nao aloca o tamanho anunciado de uma vez: a memoria cresce conforme os
+    // bytes chegam (um peer nao consegue reservar `max_payload` so com o
+    // cabecalho).
+    let len = h.length as usize;
+    let mut payload = Vec::with_capacity(len.min(64 * 1024));
+    r.take(u64::from(h.length))
+        .read_to_end(&mut payload)
+        .await?;
+    if payload.len() != len {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
     decode_payload(h.ty, &payload)
 }
 

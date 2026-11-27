@@ -67,8 +67,16 @@ Lista completa e integração com SIEM em [enterprise.md](enterprise.md#5-log-de
 
 ## Limitações conhecidas
 
-- VNC Auth (DES) considera só os 8 primeiros caracteres da senha; use `password_hash` ou `auth_command`.
+- VNC Auth (DES) considera só os 8 primeiros caracteres da senha, usa chave de 56 bits e não cifra o tráfego. Mantenha desligada (é o padrão onde há opção de configuração) e use `password_hash` ou `auth_command`; ligue só para clientes VNC legados, em rede confiável.
 - SSO OIDC só no protocolo nativo; sem tíquete Kerberos/GSSAPI nem SAML direto; ver as pontes em [enterprise.md](enterprise.md#sso-oidc-saml-entra-id-okta-keycloak).
+
+## SSO OIDC: reuso de token entre hosts
+
+- **Modo servidor central** (`machine` definido): o ticket traz `openvnc_machine` e `jti`; o host recusa ticket de outra máquina, ticket sem `jti` e reuso do mesmo `iss` + `jti` dentro da validade.
+- **Modo SSO genérico** (IdP como Entra ID, Okta, Keycloak, sem `machine`): o ID token só é amarrado à audiência (`aud`, o client id). **Todo host que aceita a mesma audiência aceita o mesmo token.** Um host comprometido (ou um operador mal-intencionado em um deles) que receba o token pode reapresentá-lo em outro host dentro da validade. O cache de reuso é por host e não impede isso.
+- Mitigação: defina `OPENVNC_OIDC_HOST_ID=<id do host>` no ambiente do servidor (ou `Verifier::require_host_binding` no código). O token passa a precisar de `openvnc_machine` igual ao id ou de `aud` contendo `<id>` ou `<client_id>:<id>`; configure o IdP para emitir esse claim/audiência por máquina. Sem isso o servidor registra um aviso na inicialização e mantém o comportamento antigo (compatibilidade).
+- Alternativa: um client id (audiência) diferente por host ou por grupo de hosts de mesmo nível de confiança, e validade curta do token.
+- O cache de reuso usa `iss` + `jti` quando há `jti`; sem `jti`, o hash de `cabeçalho.payload` (a assinatura fica de fora porque ES256 é maleável: `(r, s)` e `(r, n - s)` são ambas válidas).
 
 ## Testes de segurança
 

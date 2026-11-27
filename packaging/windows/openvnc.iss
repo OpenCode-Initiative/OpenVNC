@@ -1,10 +1,10 @@
 ; Instalador do OpenVNC para Windows (Inno Setup 6).
-;   ISCC.exe /DBinDir=<pasta com os exes> /DAppVersion=0.8.0 openvnc.iss
+;   ISCC.exe /DBinDir=<pasta com os exes> /DAppVersion=0.8.1 openvnc.iss
 #ifndef BinDir
   #define BinDir "..\..\target\release"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.8.0"
+  #define AppVersion "0.8.1"
 #endif
 
 [Setup]

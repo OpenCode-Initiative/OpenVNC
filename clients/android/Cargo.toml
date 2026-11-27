@@ -2,7 +2,7 @@
 name = "openvnc-android"
 description = "Cliente OpenVNC para Android (mesma GUI do desktop, com mouse virtual)."
 # versao do APK (o Cargo.toml da raiz ainda diz 0.0.1); acompanha VERSION
-version = "0.8.0"
+version = "0.8.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -53,6 +53,7 @@ name = "android.permission.ACCESS_NETWORK_STATE"
 [package.metadata.android.application]
 label = "OpenVNC"
 icon = "@mipmap/ic_launcher"
+allow_backup = false
 
 [package.metadata.android.application.activity]
 config_changes = "orientation|screenSize|keyboardHidden"

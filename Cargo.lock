@@ -2761,6 +2761,7 @@ dependencies = [
  "openvnc-core",
  "openvnc-framebuffer",
  "openvnc-security",
+ "rand 0.8.8",
  "tracing",
 ]
 

@@ -307,6 +307,11 @@ impl Config {
     pub fn validate(&mut self, password: &Option<String>) -> anyhow::Result<()> {
         self.idle_timeout_secs = self.idle_timeout_secs.clamp(60, 3600);
         self.tls |= self.require_tls;
+        if self.password.is_some() {
+            tracing::warn!(
+                "`password` em texto puro no arquivo de configuracao: prefira `password_hash` (gere com `openvnc-server hash-password`) e remova a senha do arquivo"
+            );
+        }
         for n in &self.allowed_networks {
             parse_cidr(n).ok_or_else(|| anyhow::anyhow!("allowed_networks: CIDR invalido: {n}"))?;
         }

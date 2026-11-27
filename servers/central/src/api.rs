@@ -41,17 +41,30 @@ fn key_of(s: &str) -> [u8; 32] {
     Sha256::digest(s.as_bytes()).into()
 }
 
-/// Bloqueio progressivo por chave (usuario ou IP).
+/// Teto do bloqueio por usuario+IP e por IP (segundos).
+const LOCK_MAX: u64 = 900;
+/// Teto do bloqueio global por usuario (segundos): curto, para que um
+/// atacante nao consiga travar a conta de outra pessoa por muito tempo.
+const LOCK_USER_MAX: u64 = 60;
+
+/// Bloqueio progressivo por chave (usuario+IP, IP ou usuario).
 pub struct Lockout {
     free: u32,
+    max: u64,
     map: HashMap<String, (u32, Option<Instant>)>,
 }
 
 impl Lockout {
-    /// `free` falhas sem bloqueio.
+    /// `free` falhas sem bloqueio, teto padrao de 15 min.
     pub fn new(free: u32) -> Self {
+        Self::with_max(free, LOCK_MAX)
+    }
+
+    /// `free` falhas sem bloqueio, bloqueio de no maximo `max` segundos.
+    pub fn with_max(free: u32, max: u64) -> Self {
         Self {
             free,
+            max: max.max(1),
             map: HashMap::new(),
         }
     }
@@ -73,7 +86,7 @@ impl Lockout {
         e.0 += 1;
         if e.0 > self.free {
             let n = (e.0 - self.free - 1).min(10);
-            let secs = (30u64 << n).min(900);
+            let secs = (30u64 << n).min(self.max);
             e.1 = Some(Instant::now() + Duration::from_secs(secs));
         }
     }
@@ -81,6 +94,28 @@ impl Lockout {
     /// Sucesso zera.
     pub fn ok(&mut self, k: &str) {
         self.map.remove(k);
+    }
+}
+
+/// Os tres bloqueios do login.
+struct Locks {
+    /// Usuario+IP: o par que esta errando a senha.
+    pair: Lockout,
+    /// So IP, mais forte: pega quem testa varios usuarios do mesmo IP.
+    ip: Lockout,
+    /// So usuario, global e curto: freia ataque distribuido sem deixar
+    /// qualquer um travar a conta alheia por muito tempo.
+    user: Lockout,
+}
+
+impl Locks {
+    fn new(free: u32) -> Self {
+        let free = free.max(1);
+        Self {
+            pair: Lockout::new(free),
+            ip: Lockout::new(free.saturating_mul(3)),
+            user: Lockout::with_max(free.saturating_mul(4), LOCK_USER_MAX),
+        }
     }
 }
 
@@ -117,7 +152,7 @@ pub struct App {
     pub audit: Arc<AuditLog>,
     sessions: Mutex<HashMap<[u8; 32], Sess>>,
     devices: Mutex<HashMap<[u8; 32], Device>>,
-    lockout: Mutex<Lockout>,
+    lockout: Mutex<Locks>,
     dummy_hash: String,
 }
 
@@ -140,7 +175,7 @@ impl App {
             .and_then(|m| m.modified())
             .ok();
         Ok(Self {
-            lockout: Mutex::new(Lockout::new(cfg.lockout_free)),
+            lockout: Mutex::new(Locks::new(cfg.lockout_free)),
             cfg,
             store_path,
             loaded: Mutex::new(Loaded { store, mtime }),
@@ -185,11 +220,15 @@ impl App {
         via: &str,
     ) -> Result<(), Response> {
         let ip_s = ip.to_string();
-        let ku = format!("u:{user}");
-        let ki = format!("i:{ip_s}");
+        let kp = format!("{user}|{ip_s}");
         {
             let l = self.lockout.lock().unwrap();
-            if let Some(s) = l.blocked(&ku).or_else(|| l.blocked(&ki)) {
+            if let Some(s) = l
+                .pair
+                .blocked(&kp)
+                .or_else(|| l.ip.blocked(&ip_s))
+                .or_else(|| l.user.blocked(user))
+            {
                 self.rec(
                     "central_login",
                     &[
@@ -212,8 +251,10 @@ impl App {
         let good = passhash::verify(password.as_bytes(), hash) && u.is_some_and(|u| !u.disabled);
         let mut l = self.lockout.lock().unwrap();
         if good {
-            l.ok(&ku);
-            l.ok(&ki);
+            // o bloqueio so por IP nao zera: senao um login valido do
+            // atacante liberaria a varredura de outros usuarios
+            l.pair.ok(&kp);
+            l.user.ok(user);
             drop(l);
             self.rec(
                 "central_login",
@@ -226,8 +267,9 @@ impl App {
             );
             Ok(())
         } else {
-            l.fail(&ku);
-            l.fail(&ki);
+            l.pair.fail(&kp);
+            l.ip.fail(&ip_s);
+            l.user.fail(user);
             drop(l);
             self.rec(
                 "central_login",
@@ -616,26 +658,74 @@ impl App {
         }
     }
 
+    /// Maquina e client_id de um codigo pendente.
+    fn device_info(&self, code: &str) -> Option<(String, String)> {
+        let d = self.devices.lock().unwrap();
+        let now = Instant::now();
+        d.values()
+            .find(|v| v.user_code == code && v.exp > now && v.approved.is_none() && !v.denied)
+            .map(|v| (v.machine.clone(), v.client_id.clone()))
+    }
+
+    /// Passo 1: so o codigo. Passo 2 (codigo valido): mostra a maquina e o
+    /// client_id do pedido ANTES de qualquer aprovacao e exige confirmacao
+    /// explicita, para o usuario nao aprovar as cegas um codigo enviado
+    /// por outra pessoa (phishing de codigo de dispositivo).
     fn device_page(&self, code: String, msg: Option<&str>) -> Response {
-        let code = html_escape(
-            &code
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .take(16)
-                .collect::<String>(),
-        );
+        let code: String = code
+            .trim()
+            .to_ascii_uppercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(16)
+            .collect();
         let m = msg
             .map(|m| format!("<p class=\"m\">{}</p>", html_escape(m)))
             .unwrap_or_default();
+        let info = if code.is_empty() {
+            None
+        } else {
+            self.device_info(&code)
+        };
+        let Some((machine, client_id)) = info else {
+            let m = if m.is_empty() && !code.is_empty() {
+                "<p class=\"m\">Codigo invalido ou expirado.</p>".to_owned()
+            } else {
+                m
+            };
+            return Response::html(
+                200,
+                page(
+                    "Aprovar acesso",
+                    &format!(
+                        "{m}<form method=\"get\" action=\"/device\">\
+                         <label>Codigo<input name=\"user_code\" required></label>\
+                         <button>Continuar</button></form>"
+                    ),
+                ),
+            );
+        };
+        let (code, machine, client_id) = (
+            html_escape(&code),
+            html_escape(&machine),
+            html_escape(&client_id),
+        );
         Response::html(
             200,
             page(
                 "Aprovar acesso",
                 &format!(
-                    "{m}<form method=\"post\" action=\"/device\">\
-                     <label>Codigo<input name=\"user_code\" value=\"{code}\" required></label>\
+                    "{m}<p>Um aplicativo pediu acesso remoto em seu nome:</p>\
+                     <ul><li>Maquina: <b>{machine}</b></li><li>Aplicativo (client_id): <b>{client_id}</b></li>\
+                     <li>Codigo: <b>{code}</b></li></ul>\
+                     <p class=\"m\">So aprove se foi voce quem iniciou esta conexao agora, para esta maquina.</p>\
+                     <form method=\"post\" action=\"/device\">\
+                     <input type=\"hidden\" name=\"user_code\" value=\"{code}\">\
+                     <input type=\"hidden\" name=\"machine\" value=\"{machine}\">\
                      <label>Usuario<input name=\"user\" autocomplete=\"username\" required></label>\
                      <label>Senha<input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\
+                     <label><input type=\"checkbox\" name=\"confirm\" value=\"yes\" style=\"display:inline;width:auto\"> \
+                     Confirmo que quero acessar a maquina {machine}</label>\
                      <button name=\"action\" value=\"approve\">Aprovar</button> \
                      <button name=\"action\" value=\"deny\">Negar</button></form>"
                 ),
@@ -654,6 +744,17 @@ impl App {
         let code = get("user_code").trim().to_ascii_uppercase();
         let user = get("user").trim().to_owned();
         let pw = get("password");
+        let approve = get("action") != "deny";
+        // aprovacao so depois de exibir a maquina e com confirmacao explicita
+        if approve {
+            let shown = self.device_info(&code).map(|(m, _)| m);
+            if shown.is_none() || shown.as_deref() != Some(get("machine").as_str()) {
+                return self.device_page(code, Some("Confira a maquina antes de aprovar."));
+            }
+            if get("confirm") != "yes" {
+                return self.device_page(code, Some("Marque a confirmacao para aprovar."));
+            }
+        }
         if !valid_name(&user) || pw.is_empty() {
             return self.device_page(code, Some("Informe usuario e senha."));
         }
@@ -673,7 +774,7 @@ impl App {
         else {
             return self.device_page(String::new(), Some("Codigo invalido ou expirado."));
         };
-        if get("action") == "deny" {
+        if !approve {
             dev.denied = true;
             return Response::html(
                 200,
@@ -771,5 +872,22 @@ mod tests {
         assert!(l.blocked("u:a").unwrap() <= 900);
         l.ok("u:a");
         assert!(l.blocked("u:a").is_none());
+    }
+
+    #[test]
+    fn bloqueio_por_usuario_e_curto_e_por_par_independe() {
+        let mut l = Locks::new(2);
+        // atacante em 10.0.0.9 erra a senha de alice muitas vezes
+        for _ in 0..30 {
+            l.pair.fail("alice|10.0.0.9");
+            l.ip.fail("10.0.0.9");
+            l.user.fail("alice");
+        }
+        assert!(l.pair.blocked("alice|10.0.0.9").unwrap() > 60);
+        assert!(l.ip.blocked("10.0.0.9").unwrap() > 60);
+        // alice de outro IP fica no maximo LOCK_USER_MAX bloqueada
+        assert!(l.pair.blocked("alice|10.0.0.5").is_none());
+        assert!(l.ip.blocked("10.0.0.5").is_none());
+        assert!(l.user.blocked("alice").unwrap() <= LOCK_USER_MAX);
     }
 }

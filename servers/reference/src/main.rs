@@ -147,7 +147,53 @@ impl Screens {
 }
 
 /// Contexto compartilhado entre conexoes.
+/// Prazo para concluir conexao + TLS + autenticacao; depois disso o
+/// cliente e derrubado (evita segurar vagas sem autenticar).
+pub(crate) const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Conexoes simultaneas (pendentes ou ativas) por IP, somando RFB e nativo.
+pub(crate) const MAX_PER_IP: usize = 4;
+
+/// Contador de conexoes por IP.
+#[derive(Default)]
+pub(crate) struct PerIp(std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>);
+
+/// Vaga reservada para um IP; libera no drop.
+pub(crate) struct IpSlot {
+    owner: Arc<PerIp>,
+    ip: std::net::IpAddr,
+}
+
+impl PerIp {
+    /// Reserva uma vaga para `ip`; None se o IP ja atingiu `MAX_PER_IP`.
+    pub(crate) fn take(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<IpSlot> {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(ip).or_insert(0);
+        if *n >= MAX_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot {
+            owner: self.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut m = self.owner.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
 struct Shared {
+    per_ip: Arc<PerIp>,
     cfg: Config,
     password: Option<String>,
     frames: watch::Receiver<Frame>,
@@ -398,6 +444,7 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         _ => None,
     };
     let shared = Arc::new(Shared {
+        per_ip: Arc::default(),
         oidc,
         cfg,
         password,
@@ -440,10 +487,19 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
             );
             continue;
         }
+        let Some(ip_slot) = shared.per_ip.take(peer.ip()) else {
+            tracing::warn!(%peer, "limite de conexoes por IP; recusado");
+            shared.audit.record(
+                "rejected",
+                &[("peer", &peer.to_string()), ("reason", "max_per_ip")],
+            );
+            continue;
+        };
         shared.clients.fetch_add(1, Ordering::SeqCst);
         tray::CLIENTS.fetch_add(1, Ordering::Relaxed);
         let sh = shared.clone();
         tokio::spawn(async move {
+            let _ip_slot = ip_slot;
             tracing::info!(%peer, "conectado");
             let p = peer.to_string();
             sh.audit.record("connect", &[("peer", &p)]);
@@ -668,6 +724,10 @@ fn verifier(
         let v = st.verify(user, token);
         if v == Verdict::Ok {
             audit.record("device_auth", &[("peer", &peer), ("device", user)]);
+            // identidade da sessao (casa a aprovacao com o canal nativo)
+            if let Ok(mut w) = who.lock() {
+                *w = user.to_string();
+            }
         } else {
             audit.record(
                 "device_auth_failed",
@@ -681,6 +741,9 @@ fn verifier(
 async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
     sock.set_nodelay(true)?;
     let mut sock: BoxStream = Box::new(sock);
+    // prazo unico para TLS + autenticacao; desliga ao inicializar
+    let auth_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+    let mut authed = false;
     let mut frames = sh.frames.clone();
     let first = frames.borrow_and_update().clone();
     // usuario da empresa autenticado (mostrado no pedido de aprovacao)
@@ -757,7 +820,7 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                     sock.write_all(&out).await?;
                     sock.flush().await?;
                     let acc = sh.tls.as_ref().expect("vencrypt so com TLS");
-                    let hs = tokio::time::timeout(Duration::from_secs(10), acc.accept(sock));
+                    let hs = tokio::time::timeout_at(auth_deadline, acc.accept(sock));
                     sock = Box::new(
                         hs.await
                             .map_err(|_| anyhow::anyhow!("timeout no handshake TLS"))?
@@ -797,12 +860,13 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                 }
                 ServerEvent::Initialized { shared, version } => {
                     tracing::debug!(shared, ?version, "cliente pronto");
+                    authed = true;
                     // sem credencial, so com autorizacao local (allow_attended)
                     let ask = sh.cfg.ask_before_accept
                         || (srv.unauthenticated() && !sh.cfg.allow_no_auth);
                     let label = who.lock().map(|w| w.clone()).unwrap_or_default();
                     if ask {
-                        _approval = tray::ask_once(&label, peer).await;
+                        _approval = tray::ask_once(&label, peer, !srv.unauthenticated()).await;
                         if _approval.is_none() {
                             sh.audit
                                 .record("rejected", &[("peer", peer), ("reason", "local_user")]);
@@ -883,6 +947,11 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                 if r.is_err() {
                     anyhow::bail!("captura encerrada");
                 }
+            }
+            _ = tokio::time::sleep_until(auth_deadline), if !authed => {
+                sh.audit.record("auth_timeout", &[("peer", peer)]);
+                let _ = sock.shutdown().await;
+                anyhow::bail!("timeout na autenticacao");
             }
             _ = tokio::time::sleep_until(idle.deadline().into()) => {
                 if !idle.expired() {

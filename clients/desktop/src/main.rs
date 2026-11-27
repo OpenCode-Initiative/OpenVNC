@@ -75,13 +75,14 @@ fn run_native_renderer(host: &str) -> anyhow::Result<()> {
     if let Ok(p) = std::env::var("OPENVNC_PASSWORD") {
         o.config.password = Some(Password::new(p));
     }
-    // OPENVNC_TLS=tls|tofu|tofu-accept|pin:<sha256>|ca:<arquivo>, OPENVNC_USER=<dispositivo>
+    // OPENVNC_TLS=tofu (padrao)|tofu-accept|tls|pin:<sha256>|ca:<arquivo>|none,
+    // OPENVNC_USER=<dispositivo>. Sem TLS so quando pedido explicitamente (none).
     let sec = std::env::var("OPENVNC_TLS").unwrap_or_default();
     let (mode, arg) = sec.split_once(':').unwrap_or((sec.as_str(), ""));
     let (mode, accept) = match mode {
-        "" => (Security::None, false),
+        "" | "tofu" => (Security::Tofu, false),
+        "none" | "plain" => (Security::None, false),
         "tls" => (Security::WebPki, false),
-        "tofu" => (Security::Tofu, false),
         "tofu-accept" => (Security::Tofu, true),
         "pin" => (Security::Pin, false),
         "ca" => (Security::Ca, false),
@@ -93,6 +94,14 @@ fn run_native_renderer(host: &str) -> anyhow::Result<()> {
         anyhow::bail!("OPENVNC_USER exige OPENVNC_TLS");
     }
     native::run(o)
+}
+
+/// Remove caracteres de controle da area de transferencia recebida, exceto
+/// quebra de linha, tab e retorno de carro.
+fn clean_clipboard(t: &str) -> String {
+    t.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t' | '\r'))
+        .collect()
 }
 
 /// Modo de seguranca escolhido na tela de conexao.
@@ -288,6 +297,10 @@ struct App {
     /// Teclado virtual do celular para digitar na maquina remota.
     osk: bool,
     fullscreen: bool,
+    /// Aceita a area de transferencia enviada pelo servidor (so com a janela em foco).
+    recv_clipboard: bool,
+    /// Confirmacao explicita para enviar a senha sem TLS.
+    plain_ok: bool,
     error: Option<String>,
     /// Conexoes abertas, uma por aba.
     tabs: Vec<Remote>,
@@ -409,6 +422,8 @@ impl App {
             touch_seen: false,
             osk: false,
             fullscreen: false,
+            recv_clipboard: true,
+            plain_ok: false,
             error: None,
             tabs: Vec::new(),
             active: None,
@@ -786,7 +801,14 @@ impl App {
                             }
                         };
                     }
-                    SessionEvent::CutText(t) => ctx.copy_text(t),
+                    SessionEvent::CutText(t) => {
+                        // so com a janela em foco, para o servidor nao trocar a area de
+                        // transferencia local em segundo plano
+                        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+                        if self.recv_clipboard && focused {
+                            ctx.copy_text(clean_clipboard(&t));
+                        }
+                    }
                     SessionEvent::Cursor {
                         hot_x,
                         hot_y,
@@ -1318,7 +1340,16 @@ impl App {
         .fill(egui::Color32::from_rgb(0x2F, 0x6F, 0xEB))
         .corner_radius(8.0)
         .min_size(egui::vec2(ui.available_width(), 44.0));
-        let ok = !self.host.trim().is_empty();
+        let plain_pw = self.security == Security::None && !self.password.is_empty();
+        if plain_pw {
+            ui.checkbox(
+                &mut self.plain_ok,
+                "Entendo que a senha sera enviada sem criptografia (sem TLS)",
+            );
+        } else {
+            self.plain_ok = false;
+        }
+        let ok = !self.host.trim().is_empty() && (!plain_pw || self.plain_ok);
         if (ui.add_enabled(ok, btn).clicked() || enter) && ok {
             self.connect(ui.ctx());
         }
@@ -1476,6 +1507,10 @@ impl eframe::App for App {
                 }
                 let osk = self.osk;
                 ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(OSK_ID), osk));
+                ui.toggle_value(&mut self.recv_clipboard, "Receber area de transferencia")
+                    .on_hover_text(
+                        "Copia para este computador o texto copiado na maquina remota (so com a janela em foco)",
+                    );
                 ui.separator();
                 if remote.files.is_some() {
                     ui.toggle_value(&mut remote.show_files, "Arquivos");
