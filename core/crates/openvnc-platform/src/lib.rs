@@ -43,6 +43,16 @@ pub trait ScreenCapture: Send {
     fn capture(&mut self, fb: &mut Framebuffer) -> Result<bool>;
     /// Nome do backend (para logs).
     fn name(&self) -> &'static str;
+    /// Monitor capturado e total de monitores (padrao: um so).
+    fn screens(&self) -> (u8, u8) {
+        (0, 1)
+    }
+    /// Passa a capturar o monitor `index` (fora do intervalo: ignora).
+    /// Depois disso, `capture` devolve `Ok(false)` se o tamanho mudou.
+    fn select_screen(&mut self, index: u8) -> Result<()> {
+        let _ = index;
+        Ok(())
+    }
 }
 
 /// Destino de eventos de entrada.

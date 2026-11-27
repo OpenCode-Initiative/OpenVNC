@@ -76,6 +76,9 @@ pub mod msg_type {
     pub const FS_RESPONSE: u16 = 0x0051;
     pub const INPUT_LOCK: u16 = 0x0060;
     pub const INPUT_LOCK_STATE: u16 = 0x0061;
+    // varios monitores no servidor
+    pub const SCREEN_SELECT: u16 = 0x0070;
+    pub const SCREEN_INFO: u16 = 0x0071;
     pub const PING: u16 = 0x00F0;
     pub const PONG: u16 = 0x00F1;
     pub const CLOSE: u16 = 0x00FF;
@@ -98,6 +101,8 @@ pub mod capability {
     pub const FS_EXPLORER: u32 = 0x0031;
     /// Bloqueio do mouse e teclado locais do servidor (INPUT_LOCK).
     pub const INPUT_LOCK: u32 = 0x0040;
+    /// Escolha do monitor capturado (SCREEN_SELECT/SCREEN_INFO).
+    pub const SCREEN_SELECT: u32 = 0x0050;
     /// Video H.264: retangulos `encoding::H264` de tela inteira, fluxo continuo.
     pub const VIDEO_H264: u32 = 0x0100;
     /// Video AV1 (reservado; ainda nao implementado).
@@ -332,6 +337,18 @@ pub enum Message {
         /// Motivo (erro ou observacao); vazio se nada a dizer.
         reason: String,
     },
+    /// Cliente pede outro monitor do servidor. `index` 255 = o proximo.
+    ScreenSelect {
+        /// Monitor pedido (0 = primeiro) ou 255 para o proximo.
+        index: u8,
+    },
+    /// Monitor atual e quantos o servidor tem.
+    ScreenInfo {
+        /// Monitor capturado agora.
+        index: u8,
+        /// Total de monitores.
+        count: u8,
+    },
     /// Keepalive.
     Ping {
         /// Valor ecoado.
@@ -375,6 +392,8 @@ impl Message {
             Message::FsResponse { .. } => FS_RESPONSE,
             Message::InputLock { .. } => INPUT_LOCK,
             Message::InputLockState { .. } => INPUT_LOCK_STATE,
+            Message::ScreenSelect { .. } => SCREEN_SELECT,
+            Message::ScreenInfo { .. } => SCREEN_INFO,
             Message::Ping { .. } => PING,
             Message::Pong { .. } => PONG,
             Message::Close { .. } => CLOSE,
@@ -567,6 +586,11 @@ fn encode_payload(m: &Message) -> Result<Vec<u8>> {
             fsops::encode_reply(&mut w, reply)?;
         }
         Message::InputLock { on } => w.u8(u8::from(*on)),
+        Message::ScreenSelect { index } => w.u8(*index),
+        Message::ScreenInfo { index, count } => {
+            w.u8(*index);
+            w.u8(*count);
+        }
         Message::InputLockState { on, reason } => {
             w.u8(u8::from(*on));
             w.str(reason)?;
@@ -825,6 +849,11 @@ pub fn decode_payload(ty: u16, payload: &[u8]) -> Result<Message> {
             reply: fsops::decode_reply(&mut r)?,
         },
         INPUT_LOCK => Message::InputLock { on: r.bool()? },
+        SCREEN_SELECT => Message::ScreenSelect { index: r.u8()? },
+        SCREEN_INFO => Message::ScreenInfo {
+            index: r.u8()?,
+            count: r.u8()?,
+        },
         INPUT_LOCK_STATE => Message::InputLockState {
             on: r.bool()?,
             reason: r.str()?,

@@ -26,6 +26,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::{button_changes, InputInjector, ScreenCapture};
 
+/// Retangulo (na area virtual) do monitor capturado, quando a captura e de
+/// um monitor so (DXGI). `None`: a imagem e a area virtual inteira (GDI).
+static VIEW: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Informa a origem (canto superior esquerdo, coordenadas da area
+/// virtual) do monitor que a captura esta mostrando.
+pub fn set_view(origin: Option<(i32, i32)>) {
+    if let Ok(mut v) = VIEW.lock() {
+        *v = origin;
+    }
+}
+
 fn virtual_screen() -> (i32, i32, i32, i32) {
     // SAFETY: GetSystemMetrics nao tem pre-condicoes.
     unsafe {
@@ -60,6 +72,7 @@ impl GdiCapture {
     /// Abre a captura no tamanho atual da tela.
     pub fn new() -> Result<Self> {
         let (x, y, w, h) = virtual_screen();
+        set_view(None);
         let (w16, h16) = (
             u16::try_from(w).map_err(|_| Error::Unsupported("tela larga demais".into()))?,
             u16::try_from(h).map_err(|_| Error::Unsupported("tela alta demais".into()))?,
@@ -311,12 +324,18 @@ impl InputInjector for SendInputInjector {
     fn pointer(&mut self, ev: PointerEvent) -> Result<()> {
         // coordenadas RFB sao relativas a area virtual capturada, que e
         // exatamente o espaco 0..65535 de MOUSEEVENTF_VIRTUALDESK
-        let (_, _, vw, vh) = virtual_screen();
+        // Com um monitor so, desloca para a posicao dele na area virtual
+        let (vx, vy, vw, vh) = virtual_screen();
+        let (ox, oy) = VIEW
+            .lock()
+            .ok()
+            .and_then(|v| *v)
+            .map_or((0, 0), |(x, y)| (x - vx, y - vy));
         let norm =
-            |v: u16, span: i32| ((i64::from(v) * 65535) / i64::from((span - 1).max(1))) as i32;
+            |v: i32, span: i32| ((i64::from(v) * 65535) / i64::from((span - 1).max(1))) as i32;
         let mut v = vec![mouse_input(
-            norm(ev.x, vw),
-            norm(ev.y, vh),
+            norm(i32::from(ev.x) + ox, vw),
+            norm(i32::from(ev.y) + oy, vh),
             0,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )];

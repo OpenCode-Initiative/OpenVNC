@@ -58,6 +58,8 @@ pub struct Shared {
     pub lock_on: bool,
     /// Ultimo motivo informado pelo servidor sobre o bloqueio.
     pub lock_msg: String,
+    /// Monitor remoto mostrado e total de monitores.
+    pub screen: (u8, u8),
 }
 
 enum Cmd {
@@ -66,6 +68,7 @@ enum Cmd {
     Reject(u32),
     Fs(FsOp, oneshot::Sender<FsReply>),
     Lock(bool),
+    Screen(u8),
 }
 
 /// Acesso ao explorador remoto pela conexao de arquivos (clonavel, usado
@@ -160,6 +163,16 @@ impl FileLink {
     pub fn lock(&self, on: bool) {
         let _ = self.tx.send(Cmd::Lock(on));
     }
+
+    /// Pede o proximo monitor do computador remoto.
+    pub fn next_screen(&self) {
+        let _ = self.tx.send(Cmd::Screen(u8::MAX));
+    }
+
+    /// Quantos monitores o computador remoto tem (0 se nao informado).
+    pub fn screen_count(&self) -> u8 {
+        self.shared.lock().map(|s| s.screen.1).unwrap_or(0)
+    }
 }
 
 fn with(shared: &Mutex<Shared>, ctx: &egui::Context, f: impl FnOnce(&mut Shared)) {
@@ -225,6 +238,9 @@ async fn run(
                         s.lock_on = on;
                         s.lock_msg = reason;
                     });
+                }
+                Ok(NativeEvent::ScreenInfo { index, count }) => {
+                    with(&shared, &ctx, |s| s.screen = (index, count));
                 }
                 Ok(ev) => on_event(&shared, &ctx, ev),
                 Err(e) => {
@@ -301,6 +317,9 @@ async fn run(
                     // liga o sinal de vida antes da confirmacao chegar
                     locked = locked || on;
                     let _ = sender.input_lock(on);
+                }
+                Some(Cmd::Screen(i)) => {
+                    let _ = sender.select_screen(i);
                 }
                 Some(Cmd::Reject(id)) => {
                     let _ = c.reject_file(id);

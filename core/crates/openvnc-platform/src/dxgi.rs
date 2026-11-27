@@ -1,10 +1,10 @@
-//! Captura Windows por DXGI Desktop Duplication (monitor primario).
+//! Captura Windows por DXGI Desktop Duplication (um monitor por vez).
 //!
 //! A GPU compoe o quadro; copiamos para uma textura de staging e lemos
 //! so quando o DWM apresentou algo novo. Sem mudanca na tela,
 //! `AcquireNextFrame` expira e o framebuffer fica como estava.
 //!
-//! Limites: um monitor (o primeiro do adaptador padrao), sem rotacao.
+//! Limites: um monitor por vez (os do adaptador padrao), sem rotacao.
 //! Em sessoes sem GPU (servico, alguns RDP) a criacao falha e o
 //! chamador cai para GDI.
 #![allow(unsafe_code)]
@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 
 use crate::ScreenCapture;
@@ -34,7 +34,10 @@ fn err(what: &str, e: windows::core::Error) -> Error {
 pub struct DxgiCapture {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
+    adapter: IDXGIAdapter,
     output: IDXGIOutput1,
+    index: u8,
+    count: u8,
     dup: IDXGIOutputDuplication,
     staging: Option<ID3D11Texture2D>,
     w: u16,
@@ -46,6 +49,33 @@ pub struct DxgiCapture {
 // SAFETY: o device D3D11 e free-threaded; o contexto imediato e a
 // duplicacao so sao usados por quem tem `&mut self`, uma thread por vez.
 unsafe impl Send for DxgiCapture {}
+
+fn open_output(adapter: &IDXGIAdapter, i: u8) -> Result<IDXGIOutput1> {
+    // SAFETY: chamadas COM em interface valida.
+    unsafe {
+        adapter
+            .EnumOutputs(u32::from(i))
+            .map_err(|e| err("EnumOutputs", e))?
+            .cast()
+            .map_err(|e| err("IDXGIOutput1", e))
+    }
+}
+
+fn count_outputs(adapter: &IDXGIAdapter) -> u8 {
+    // SAFETY: EnumOutputs devolve erro quando acaba a lista.
+    (0u8..16)
+        .take_while(|i| unsafe { adapter.EnumOutputs(u32::from(*i)) }.is_ok())
+        .count() as u8
+}
+
+/// Publica a origem do monitor para o injetor de mouse.
+fn publish_view(o: &IDXGIOutput1) {
+    // SAFETY: GetDesc so escreve na struct devolvida.
+    if let Ok(d) = unsafe { o.GetDesc() } {
+        let r = d.DesktopCoordinates;
+        crate::windows::set_view(Some((r.left, r.top)));
+    }
+}
 
 fn output_size(o: &IDXGIOutput1) -> Result<(u16, u16)> {
     // SAFETY: GetDesc so escreve na struct devolvida.
@@ -85,22 +115,22 @@ impl DxgiCapture {
         let ctx = ctx.ok_or_else(|| Error::Unsupported("DXGI: sem contexto".into()))?;
         let dxgi: IDXGIDevice = device.cast().map_err(|e| err("IDXGIDevice", e))?;
         // SAFETY: chamadas COM em interfaces validas.
-        let output: IDXGIOutput1 = unsafe {
-            let adapter = dxgi.GetAdapter().map_err(|e| err("GetAdapter", e))?;
-            adapter
-                .EnumOutputs(0)
-                .map_err(|e| err("EnumOutputs", e))?
-                .cast()
-                .map_err(|e| err("IDXGIOutput1", e))?
-        };
+        // SAFETY: chamada COM em interface valida.
+        let adapter = unsafe { dxgi.GetAdapter() }.map_err(|e| err("GetAdapter", e))?;
+        let output = open_output(&adapter, 0)?;
+        let count = count_outputs(&adapter).max(1);
         let (w, h) = output_size(&output)?;
+        publish_view(&output);
         // SAFETY: device e output validos.
         let dup =
             unsafe { output.DuplicateOutput(&device) }.map_err(|e| err("DuplicateOutput", e))?;
         Ok(DxgiCapture {
             device,
             ctx,
+            adapter,
             output,
+            index: 0,
+            count,
             dup,
             staging: None,
             w,
@@ -144,6 +174,30 @@ impl DxgiCapture {
 impl ScreenCapture for DxgiCapture {
     fn size(&self) -> (u16, u16) {
         (self.w, self.h)
+    }
+
+    fn screens(&self) -> (u8, u8) {
+        (self.index, self.count)
+    }
+
+    fn select_screen(&mut self, index: u8) -> Result<()> {
+        self.count = count_outputs(&self.adapter).max(1);
+        if index >= self.count || index == self.index {
+            return Ok(());
+        }
+        let output = open_output(&self.adapter, index)?;
+        // SAFETY: device e output validos.
+        let dup = unsafe { output.DuplicateOutput(&self.device) }
+            .map_err(|e| err("DuplicateOutput", e))?;
+        (self.w, self.h) = output_size(&output)?;
+        publish_view(&output);
+        self.output = output;
+        self.dup = dup;
+        self.index = index;
+        self.staging = None;
+        self.have_frame = false;
+        self.row = vec![[0; 4]; usize::from(self.w)];
+        Ok(())
     }
 
     fn capture(&mut self, fb: &mut Framebuffer) -> Result<bool> {

@@ -132,6 +132,13 @@ impl NativeSender {
             .map_err(|_| perr("conexao encerrada"))
     }
 
+    /// Pede para mostrar outro monitor do servidor (255 = o proximo).
+    pub fn select_screen(&self, index: u8) -> Result<()> {
+        self.0
+            .send((Chan::Control, Message::ScreenSelect { index }))
+            .map_err(|_| perr("conexao encerrada"))
+    }
+
     /// Sinal de vida (PING).
     pub fn ping(&self, nonce: u64) -> Result<()> {
         self.0
@@ -262,6 +269,13 @@ pub enum NativeEvent {
         on: bool,
         /// Motivo (vazio quando tudo certo).
         reason: String,
+    },
+    /// Monitor mostrado e quantos o servidor tem.
+    ScreenInfo {
+        /// Indice do monitor atual.
+        index: u8,
+        /// Total de monitores.
+        count: u8,
     },
 }
 
@@ -477,6 +491,7 @@ impl NativeClient {
                     capability::FILE_TRANSFER,
                     capability::FS_EXPLORER,
                     capability::INPUT_LOCK,
+                    capability::SCREEN_SELECT,
                 ]
             } else {
                 vec![
@@ -485,6 +500,7 @@ impl NativeClient {
                     capability::FILE_TRANSFER,
                     capability::FS_EXPLORER,
                     capability::INPUT_LOCK,
+                    capability::SCREEN_SELECT,
                 ]
             },
             name: format!("openvnc-client {}", crate::VERSION),
@@ -654,6 +670,9 @@ impl NativeClient {
                 }
                 Message::InputLockState { on, reason } => {
                     return Ok(NativeEvent::InputLockState { on, reason })
+                }
+                Message::ScreenInfo { index, count } => {
+                    return Ok(NativeEvent::ScreenInfo { index, count })
                 }
                 Message::Ping { nonce } => self.send(Chan::Control, Message::Pong { nonce })?,
                 Message::Close { code, reason } => {

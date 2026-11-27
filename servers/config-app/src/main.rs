@@ -255,6 +255,7 @@ struct App {
     f_send: bool,
     f_dir: String,
     f_max: String,
+    idle_min: u32,
     // pareamento
     pair_name: String,
     pair_out: Option<String>,
@@ -307,6 +308,12 @@ impl App {
                 .and_then(|v| v.as_integer())
                 .unwrap_or(4096)
                 .to_string(),
+            idle_min: (table
+                .get("idle_timeout_secs")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(60)
+                .clamp(60, 3600)
+                / 60) as u32,
             pair_name: String::new(),
             pair_out: None,
             fingerprint: None,
@@ -423,6 +430,10 @@ impl App {
         }
         let max: i64 = self.f_max.trim().parse().unwrap_or(4096);
         t.insert("files_max_mb".into(), max.into());
+        t.insert(
+            "idle_timeout_secs".into(),
+            (i64::from(self.idle_min.clamp(1, 60)) * 60).into(),
+        );
         t.insert("capture".into(), "native".into());
         t.insert("setup_done".into(), true.into());
         if !t.contains_key("state_dir") {
@@ -712,6 +723,14 @@ impl App {
                     )
                     .weak(),
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Encerrar conexao sem acao do cliente apos (minutos):");
+                    ui.add(egui::Slider::new(&mut self.idle_min, 1..=60));
+                    tip(
+                        ui,
+                        "Se o cliente nao mexer o mouse nem digitar nada por esse tempo, a conexao e encerrada. Padrao 1 minuto, maximo 1 hora.",
+                    );
+                });
                 with_tip(
                     ui,
                     "Inicia o servidor automaticamente quando voce entra no Windows. \
@@ -1174,6 +1193,7 @@ mod tests {
             f_send: true,
             f_dir: String::new(),
             f_max: "4096".into(),
+            idle_min: 1,
             pair_name: String::new(),
             pair_out: None,
             fingerprint: None,

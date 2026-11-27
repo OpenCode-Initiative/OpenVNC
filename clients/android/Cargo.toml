@@ -36,6 +36,7 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "glow
 
 [package.metadata.android]
 package = "org.opencode.openvnc"
+resources = "res"
 apk_name = "OpenVNC"
 build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
 
@@ -51,6 +52,7 @@ name = "android.permission.ACCESS_NETWORK_STATE"
 
 [package.metadata.android.application]
 label = "OpenVNC"
+icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.application.activity]
 config_changes = "orientation|screenSize|keyboardHidden"

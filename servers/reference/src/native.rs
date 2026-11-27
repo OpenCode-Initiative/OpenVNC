@@ -518,6 +518,7 @@ async fn handshake(
     }
     if sh.input.is_some() {
         ours.push(capability::INPUT_LOCK);
+        ours.push(capability::SCREEN_SELECT);
     }
     let caps: Vec<u32> = capabilities
         .iter()
@@ -623,7 +624,12 @@ async fn session(
         Some(a) => a,
         None => sh.cfg.ask_before_accept,
     } || (no_auth && !sh.cfg.allow_no_auth);
-    if ask && !crate::tray::ask_accept(&crate::tray::who_label(&user, peer)).await {
+    let approval = if ask {
+        crate::tray::ask_once(&user, peer).await
+    } else {
+        None
+    };
+    if ask && approval.is_none() {
         sh.audit
             .record("rejected", &[("peer", peer), ("reason", "local_user")]);
         close(ctrl, close_code::AUTH_FAILED, "recusado pelo usuario local").await;
@@ -645,6 +651,14 @@ async fn session(
     let lock_ok = control && sh.input.is_some() && caps.contains(&capability::INPUT_LOCK);
     let mut lock: Option<Locked> = None;
     let mut last_seen = std::time::Instant::now();
+    let mut idle = crate::idle::Idle::new(peer, sh.cfg.idle_timeout_secs);
+    let mut screens = caps
+        .contains(&capability::SCREEN_SELECT)
+        .then(|| sh.screens.info.clone());
+    if let Some(rx) = &mut screens {
+        let (index, count) = *rx.borrow_and_update();
+        ctrl.send(Message::ScreenInfo { index, count }).await?;
+    }
     let zlib = caps.contains(&capability::TILE_ZLIB);
     let mut video = Video::new(caps.contains(&capability::VIDEO_H264));
     let mut frames = sh.frames.clone();
@@ -691,7 +705,15 @@ async fn session(
             }
         }
         tokio::select! {
-            m = inbox.recv() => { last_seen = std::time::Instant::now(); match m {
+            m = inbox.recv() => { last_seen = std::time::Instant::now();
+                // acao do usuario (nao conta confirmacao de quadro nem keepalive)
+                if !matches!(
+                    m,
+                    None | Some(Message::FrameAck { .. } | Message::Ping { .. } | Message::Pong { .. })
+                ) {
+                    idle.touch();
+                }
+                match m {
                 None => return Ok(()),
                 Some(Message::FrameAck { seq: s }) => {
                     if s > seq {
@@ -744,6 +766,11 @@ async fn session(
                     let reply = tokio::task::block_in_place(|| fsx.handle(&op));
                     crate::fsexplorer::audit(&sh.audit, peer, &user, &op, &reply);
                     ctrl.send(Message::FsResponse { id, reply }).await?;
+                }
+                Some(Message::ScreenSelect { index }) => {
+                    if control {
+                        sh.screens.select(index);
+                    }
                 }
                 Some(Message::InputLock { on }) => {
                     let reason = if !on {
@@ -811,11 +838,27 @@ async fn session(
                 }
                 let _ = ctrl.try_send(Message::InputLockState { on: false, reason: "liberado por inatividade".into() });
             }
+            r = async { screens.as_mut().expect("guardado").changed().await }, if screens.is_some() => {
+                if r.is_err() {
+                    screens = None;
+                } else if let Some(rx) = &mut screens {
+                    let (index, count) = *rx.borrow_and_update();
+                    ctrl.send(Message::ScreenInfo { index, count }).await?;
+                }
+            }
             r = frames.changed(), if seq - acked < WINDOW => {
                 if r.is_err() {
                     close(ctrl, close_code::SERVER_SHUTDOWN, "captura encerrada").await;
                     return Ok(());
                 }
+            }
+            _ = tokio::time::sleep_until(idle.deadline().into()) => {
+                if !idle.expired() {
+                    continue;
+                }
+                sh.audit.record("idle_timeout", &[("peer", peer)]);
+                close(ctrl, close_code::SERVER_SHUTDOWN, "encerrada por inatividade").await;
+                return Ok(());
             }
         }
     }

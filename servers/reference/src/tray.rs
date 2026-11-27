@@ -69,6 +69,61 @@ pub async fn ask_accept(peer: &str) -> bool {
     matches!(task.await, Ok(true))
 }
 
+/// Sessoes aprovadas em andamento, por IP. O cliente abre duas conexoes
+/// (tela RFB e canal nativo de arquivos); com isto o usuario local aprova
+/// uma vez so: a segunda conexao do mesmo IP aproveita a aprovacao enquanto
+/// a primeira estiver aberta.
+static APPROVED: std::sync::Mutex<Vec<(std::net::IpAddr, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+/// Uma pergunta por vez: a segunda conexao espera a resposta da primeira.
+static ASKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Aprovacao valida enquanto a sessao existir.
+pub struct Approval(Option<std::net::IpAddr>);
+
+impl Drop for Approval {
+    fn drop(&mut self) {
+        if let (Some(ip), Ok(mut v)) = (self.0, APPROVED.lock()) {
+            if let Some(i) = v.iter().position(|(a, _)| *a == ip) {
+                v[i].1 -= 1;
+                if v[i].1 == 0 {
+                    v.remove(i);
+                }
+            }
+        }
+    }
+}
+
+fn hold(ip: std::net::IpAddr) -> Approval {
+    if let Ok(mut v) = APPROVED.lock() {
+        match v.iter_mut().find(|(a, _)| *a == ip) {
+            Some(e) => e.1 += 1,
+            None => v.push((ip, 1)),
+        }
+    }
+    Approval(Some(ip))
+}
+
+/// Como `ask_accept`, mas sem perguntar de novo se ja ha sessao aprovada
+/// do mesmo IP. `None` = recusado.
+pub async fn ask_once(user: &str, peer: &str) -> Option<Approval> {
+    let Some(ip) = crate::lockout::peer_ip(peer) else {
+        return ask_accept(&who_label(user, peer))
+            .await
+            .then_some(Approval(None));
+    };
+    let _turn = ASKING.lock().await;
+    let known = APPROVED
+        .lock()
+        .map(|v| v.iter().any(|(a, n)| *a == ip && *n > 0))
+        .unwrap_or(false);
+    if known || ask_accept(&who_label(user, peer)).await {
+        Some(hold(ip))
+    } else {
+        None
+    }
+}
+
 // FFI Win32 (Shell_NotifyIcon, menus, MessageBox e dialogo de arquivo)
 #[cfg(windows)]
 #[allow(unsafe_code)]

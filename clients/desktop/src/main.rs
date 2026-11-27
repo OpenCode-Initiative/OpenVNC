@@ -1358,7 +1358,8 @@ impl eframe::App for App {
         if next_tab && !self.tabs.is_empty() {
             self.active = Some(self.active.map_or(0, |a| (a + 1) % self.tabs.len()));
         }
-        if !self.tabs.is_empty() {
+        // celular conectado: tela cheia, as abas ficam no menu flutuante
+        if !self.tabs.is_empty() && !(self.mobile && self.active.is_some()) {
             self.tab_bar(ctx);
         }
         let title = match self.active {
@@ -1398,8 +1399,20 @@ impl eframe::App for App {
 
         let mut disconnect = false;
         let mobile = self.mobile;
+        let (mut switch_to, mut new_conn) = (None, false);
+        let tabs_list: Vec<(String, bool)> = if mobile {
+            self.tabs
+                .iter()
+                .map(|t| (t.label.clone(), t.connected))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let remote = &mut self.tabs[i];
         if mobile {
             let mut fit = self.scale == Scale::Fit;
+            let mut want_screen = false;
+            let many = remote.files.as_ref().is_some_and(|f| f.screen_count() > 1);
             hud::show(
                 ctx,
                 hud::Hud {
@@ -1413,8 +1426,18 @@ impl eframe::App for App {
                     title: &remote.title,
                     status: &remote.status,
                     encrypted: remote.encrypted,
+                    tabs: tabs_list,
+                    active: i,
+                    switch_to: &mut switch_to,
+                    new_conn: &mut new_conn,
+                    next_screen: many.then_some(&mut want_screen),
                 },
             );
+            if want_screen {
+                if let Some(f) = &remote.files {
+                    f.next_screen();
+                }
+            }
             self.scale = if fit { Scale::Fit } else { Scale::Native };
             let osk = self.osk;
             ctx.data_mut(|d| d.insert_temp(egui::Id::new(OSK_ID), osk));
@@ -1559,6 +1582,10 @@ impl eframe::App for App {
             });
         if disconnect {
             self.close_tab(i);
+        } else if new_conn {
+            self.active = None;
+        } else if let Some(j) = switch_to {
+            self.active = Some(j);
         }
     }
 }

@@ -11,6 +11,7 @@ mod dpapi;
 mod extauth;
 mod files;
 mod fsexplorer;
+mod idle;
 mod inputlock;
 mod lockout;
 mod native;
@@ -28,7 +29,7 @@ use openvnc_security::pairing::{DeviceStore, Verdict};
 use openvnc_security::{passhash, Password};
 use openvnc_transport::tls::{ServerIdentity, TlsAcceptor};
 use openvnc_transport::BoxStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -121,11 +122,36 @@ enum Input {
     Pointer(PointerEvent),
 }
 
+/// Escolha do monitor capturado: pedido dos clientes e estado atual.
+#[derive(Clone)]
+pub(crate) struct Screens {
+    /// Monitor pedido; `NO_REQUEST` = nada pendente.
+    req: Arc<AtomicU8>,
+    /// (monitor atual, total).
+    pub(crate) info: watch::Receiver<(u8, u8)>,
+}
+
+const NO_REQUEST: u8 = u8::MAX;
+
+impl Screens {
+    /// Pede um monitor; 255 = o proximo.
+    pub(crate) fn select(&self, index: u8) {
+        let (cur, n) = *self.info.borrow();
+        let i = if index == u8::MAX {
+            (cur + 1) % n.max(1)
+        } else {
+            index
+        };
+        self.req.store(i, Ordering::Relaxed);
+    }
+}
+
 /// Contexto compartilhado entre conexoes.
 struct Shared {
     cfg: Config,
     password: Option<String>,
     frames: watch::Receiver<Frame>,
+    screens: Screens,
     input: Option<mpsc::Sender<Input>>,
     clients: AtomicUsize,
     tls: Option<TlsAcceptor>,
@@ -194,6 +220,10 @@ fn main() -> anyhow::Result<()> {
     }
     cfg.validate(&password)?;
 
+    if cli.tray && !single_instance() {
+        tracing::warn!("ja existe um OpenVNC Server com bandeja rodando; saindo");
+        return Ok(());
+    }
     let rt = tokio::runtime::Runtime::new()?;
     let tray = cli.tray;
     let admin = cfg.admin_password_hash.is_some();
@@ -206,6 +236,23 @@ fn main() -> anyhow::Result<()> {
         }
         run(listener, cfg, password).await
     })
+}
+
+/// Garante uma so instancia com bandeja por sessao (mutex nomeado). O
+/// handle fica aberto ate o processo sair.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn single_instance() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\OpenVNC.Server.Tray\0".encode_utf16().collect();
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    !h.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
+}
+
+#[cfg(not(windows))]
+fn single_instance() -> bool {
+    true
 }
 
 fn read_stdin_secret() -> anyhow::Result<String> {
@@ -276,7 +323,7 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         CaptureKind::Native => openvnc_platform::native_capture()?,
     };
     tracing::info!(backend = capture.name(), size = ?capture.size(), "captura");
-    let frames = spawn_capture(capture, cfg.max_fps)?;
+    let (frames, screens) = spawn_capture(capture, cfg.max_fps)?;
     let input = if cfg.view_only {
         None
     } else {
@@ -355,6 +402,7 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
         cfg,
         password,
         frames,
+        screens,
         input,
         clients: AtomicUsize::new(0),
         tls,
@@ -419,8 +467,14 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
 fn spawn_capture(
     mut cap: Box<dyn ScreenCapture>,
     max_fps: u32,
-) -> anyhow::Result<watch::Receiver<Frame>> {
+) -> anyhow::Result<(watch::Receiver<Frame>, Screens)> {
     let (w, h) = cap.size();
+    let req = Arc::new(AtomicU8::new(NO_REQUEST));
+    let (info_tx, info) = watch::channel(cap.screens());
+    let screens = Screens {
+        req: req.clone(),
+        info,
+    };
     let mut fb = Framebuffer::new(w, h, DEFAULT_MAX_BYTES)?;
     cap.capture(&mut fb)?;
     let (tx, rx) = watch::channel(Frame {
@@ -436,6 +490,14 @@ fn spawn_capture(
             let mut interval = min;
             loop {
                 let t0 = Instant::now();
+                let want = req.swap(NO_REQUEST, Ordering::Relaxed);
+                if want != NO_REQUEST {
+                    match cap.select_screen(want) {
+                        Ok(()) => tracing::info!(monitor = want, "monitor trocado"),
+                        Err(e) => tracing::warn!("troca de monitor falhou: {e}"),
+                    }
+                    let _ = info_tx.send(cap.screens());
+                }
                 match cap.capture(&mut fb) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -481,7 +543,7 @@ fn spawn_capture(
                 }
             }
         })?;
-    Ok(rx)
+    Ok((rx, screens))
 }
 
 fn spawn_injector(mut inj: Box<dyn InputInjector>) -> mpsc::Sender<Input> {
@@ -656,6 +718,9 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
         pending: None,
     };
     let mut buf = vec![0u8; 64 * 1024];
+    // aprovacao do usuario local, valida enquanto a sessao durar
+    let mut _approval: Option<tray::Approval> = None;
+    let mut idle = idle::Idle::new(peer, sh.cfg.idle_timeout_secs);
     let mut size = (first.fb.width(), first.fb.height());
     let (mut updates, mut bytes, mut since) = (0u32, 0usize, Instant::now());
     loop {
@@ -719,11 +784,13 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                     view.pending = Some((inc, r));
                 }
                 ServerEvent::Key(k) => {
+                    idle.touch();
                     if let Some(tx) = &sh.input {
                         let _ = tx.send(Input::Key(k));
                     }
                 }
                 ServerEvent::Pointer(p) => {
+                    idle.touch();
                     if let Some(tx) = &sh.input {
                         let _ = tx.send(Input::Pointer(p));
                     }
@@ -734,10 +801,13 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                     let ask = sh.cfg.ask_before_accept
                         || (srv.unauthenticated() && !sh.cfg.allow_no_auth);
                     let label = who.lock().map(|w| w.clone()).unwrap_or_default();
-                    if ask && !tray::ask_accept(&tray::who_label(&label, peer)).await {
-                        sh.audit
-                            .record("rejected", &[("peer", peer), ("reason", "local_user")]);
-                        anyhow::bail!("recusado pelo usuario local");
+                    if ask {
+                        _approval = tray::ask_once(&label, peer).await;
+                        if _approval.is_none() {
+                            sh.audit
+                                .record("rejected", &[("peer", peer), ("reason", "local_user")]);
+                            anyhow::bail!("recusado pelo usuario local");
+                        }
                     }
                     let enc = if srv.tls_subtype().is_some() {
                         "tls"
@@ -813,6 +883,14 @@ async fn serve(sock: TcpStream, sh: &Shared, peer: &str) -> anyhow::Result<()> {
                 if r.is_err() {
                     anyhow::bail!("captura encerrada");
                 }
+            }
+            _ = tokio::time::sleep_until(idle.deadline().into()) => {
+                if !idle.expired() {
+                    continue;
+                }
+                sh.audit.record("idle_timeout", &[("peer", peer)]);
+                let _ = sock.shutdown().await;
+                return Ok(());
             }
         }
     }

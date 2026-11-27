@@ -78,6 +78,9 @@ pub struct Config {
     pub lan_only: bool,
     /// Perguntar ao usuario local antes de aceitar cada conexao.
     pub ask_before_accept: bool,
+    /// Encerra a sessao sem nenhuma acao do cliente (teclado ou mouse) por
+    /// este tempo, em segundos. Padrao 60; aceito de 60 a 3600.
+    pub idle_timeout_secs: u64,
     /// Permitir conexao sem senha, desde que o usuario local autorize na
     /// hora (como o AnyDesk). Quem entra com senha ou dispositivo pareado
     /// nao passa pela pergunta.
@@ -164,6 +167,7 @@ impl Default for Config {
             setup_done: false,
             lan_only: false,
             ask_before_accept: false,
+            idle_timeout_secs: 60,
             allow_attended: false,
             files_send: false,
             files_receive: false,
@@ -301,6 +305,7 @@ impl Config {
 
     /// Valida combinacoes perigosas. Normaliza `require_tls -> tls`.
     pub fn validate(&mut self, password: &Option<String>) -> anyhow::Result<()> {
+        self.idle_timeout_secs = self.idle_timeout_secs.clamp(60, 3600);
         self.tls |= self.require_tls;
         for n in &self.allowed_networks {
             parse_cidr(n).ok_or_else(|| anyhow::anyhow!("allowed_networks: CIDR invalido: {n}"))?;
