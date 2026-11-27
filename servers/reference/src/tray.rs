@@ -14,6 +14,7 @@ struct Info {
     port: u16,
     name: String,
     /// Ha senha de administracao: parar exige o app de configuracoes.
+    #[cfg_attr(not(windows), allow(dead_code))]
     admin: bool,
 }
 static INFO: OnceLock<Info> = OnceLock::new();
@@ -498,7 +499,10 @@ mod who_tests {
 
     #[test]
     fn mostra_usuario_e_origem() {
-        assert_eq!(who_label("joao.silva", "10.1.2.3:5"), "joao.silva de 10.1.2.3:5");
+        assert_eq!(
+            who_label("joao.silva", "10.1.2.3:5"),
+            "joao.silva de 10.1.2.3:5"
+        );
         assert_eq!(who_label("  ", "10.1.2.3:5"), "10.1.2.3:5");
         assert_eq!(who_label(crate::config::REMOTE_USER, "p"), "p");
         assert_eq!(who_label("a\nb", "p"), "ab de p");

@@ -13,8 +13,8 @@ use eframe::egui;
 use openvnc_client::native::{
     NativeAuth, NativeClient, NativeEvent, NativeOptions, NativeTransport,
 };
-use openvnc_transport::tls::ClientTls;
 use openvnc_protocol::{FsOp, FsReply};
+use openvnc_transport::tls::ClientTls;
 use tokio::sync::{mpsc, oneshot};
 
 /// Tamanho maximo aceito por arquivo recebido.

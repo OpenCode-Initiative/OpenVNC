@@ -128,10 +128,17 @@ enum Auth {
 
 impl App {
     /// Monta o estado.
-    pub fn new(cfg: Config, signing_pkcs8: &[u8], ca_pem: String, audit: Arc<AuditLog>) -> anyhow::Result<Self> {
+    pub fn new(
+        cfg: Config,
+        signing_pkcs8: &[u8],
+        ca_pem: String,
+        audit: Arc<AuditLog>,
+    ) -> anyhow::Result<Self> {
         let store_path = cfg.store_path();
         let store = Store::load(&store_path)?;
-        let mtime = std::fs::metadata(&store_path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&store_path)
+            .and_then(|m| m.modified())
+            .ok();
         Ok(Self {
             lockout: Mutex::new(Lockout::new(cfg.lockout_free)),
             cfg,
@@ -149,7 +156,9 @@ impl App {
     /// Copia do banco, relida se o arquivo mudou.
     pub fn store(&self) -> Store {
         let mut g = self.loaded.lock().unwrap();
-        let mt = std::fs::metadata(&self.store_path).and_then(|m| m.modified()).ok();
+        let mt = std::fs::metadata(&self.store_path)
+            .and_then(|m| m.modified())
+            .ok();
         if mt != g.mtime {
             match Store::load(&self.store_path) {
                 Ok(s) => {
@@ -168,15 +177,32 @@ impl App {
     }
 
     /// Confere usuario e senha com bloqueio progressivo (bloqueante: Argon2).
-    fn check_password(&self, user: &str, password: &str, ip: IpAddr, via: &str) -> Result<(), Response> {
+    fn check_password(
+        &self,
+        user: &str,
+        password: &str,
+        ip: IpAddr,
+        via: &str,
+    ) -> Result<(), Response> {
         let ip_s = ip.to_string();
         let ku = format!("u:{user}");
         let ki = format!("i:{ip_s}");
         {
             let l = self.lockout.lock().unwrap();
             if let Some(s) = l.blocked(&ku).or_else(|| l.blocked(&ki)) {
-                self.rec("central_login", &[("user", user), ("ip", &ip_s), ("via", via), ("result", "bloqueado")]);
-                return Err(Response::error(429, &format!("muitas tentativas, aguarde {s} s")));
+                self.rec(
+                    "central_login",
+                    &[
+                        ("user", user),
+                        ("ip", &ip_s),
+                        ("via", via),
+                        ("result", "bloqueado"),
+                    ],
+                );
+                return Err(Response::error(
+                    429,
+                    &format!("muitas tentativas, aguarde {s} s"),
+                ));
             }
         }
         let st = self.store();
@@ -189,13 +215,29 @@ impl App {
             l.ok(&ku);
             l.ok(&ki);
             drop(l);
-            self.rec("central_login", &[("user", user), ("ip", &ip_s), ("via", via), ("result", "ok")]);
+            self.rec(
+                "central_login",
+                &[
+                    ("user", user),
+                    ("ip", &ip_s),
+                    ("via", via),
+                    ("result", "ok"),
+                ],
+            );
             Ok(())
         } else {
             l.fail(&ku);
             l.fail(&ki);
             drop(l);
-            self.rec("central_login", &[("user", user), ("ip", &ip_s), ("via", via), ("result", "falha")]);
+            self.rec(
+                "central_login",
+                &[
+                    ("user", user),
+                    ("ip", &ip_s),
+                    ("via", via),
+                    ("result", "falha"),
+                ],
+            );
             Err(Response::error(401, "usuario ou senha invalidos"))
         }
     }
@@ -242,7 +284,13 @@ impl App {
         let Some(eff) = st.effective(user, machine) else {
             self.rec(
                 "central_ticket",
-                &[("user", user), ("machine", machine), ("via", via), ("ip", &ip.to_string()), ("result", "negado")],
+                &[
+                    ("user", user),
+                    ("machine", machine),
+                    ("via", via),
+                    ("ip", &ip.to_string()),
+                    ("result", "negado"),
+                ],
             );
             return Err(Response::error(403, "sem permissao para esta maquina"));
         };
@@ -338,7 +386,10 @@ impl App {
                 exp: now + Duration::from_secs(self.cfg.session_ttl),
             },
         );
-        Response::json(200, &json!({"session": tok, "user": user, "expires_in": self.cfg.session_ttl}))
+        Response::json(
+            200,
+            &json!({"session": tok, "user": user, "expires_in": self.cfg.session_ttl}),
+        )
     }
 
     fn api_machines(&self, r: &Request) -> Response {
@@ -375,7 +426,10 @@ impl App {
             return Response::error(400, "maquina invalida");
         }
         match self.issue(&user, machine, "api", r.peer) {
-            Ok(t) => Response::json(200, &json!({"ticket": t, "expires_in": self.cfg.ticket_ttl})),
+            Ok(t) => Response::json(
+                200,
+                &json!({"ticket": t, "expires_in": self.cfg.ticket_ttl}),
+            ),
             Err(e) => e,
         }
     }
@@ -391,16 +445,34 @@ impl App {
         };
         let st = self.store();
         if !valid_name(id) || !st.machine_secret_ok(id, secret.trim()) {
-            self.rec("central_audit_in", &[("machine", if valid_name(id) { id } else { "?" }), ("ip", &r.peer.to_string()), ("result", "negado")]);
+            self.rec(
+                "central_audit_in",
+                &[
+                    ("machine", if valid_name(id) { id } else { "?" }),
+                    ("ip", &r.peer.to_string()),
+                    ("result", "negado"),
+                ],
+            );
             return Response::error(401, "credencial da maquina invalida");
         }
         let txt = String::from_utf8_lossy(&r.body);
         let mut n = 0;
         for line in txt.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if line.len() > MAX_EVENT || serde_json::from_str::<Value>(line).map(|v| !v.is_object()).unwrap_or(true) {
+            if line.len() > MAX_EVENT
+                || serde_json::from_str::<Value>(line)
+                    .map(|v| !v.is_object())
+                    .unwrap_or(true)
+            {
                 continue;
             }
-            self.rec("remote", &[("machine", id), ("ip", &r.peer.to_string()), ("entry", line)]);
+            self.rec(
+                "remote",
+                &[
+                    ("machine", id),
+                    ("ip", &r.peer.to_string()),
+                    ("entry", line),
+                ],
+            );
             n += 1;
         }
         Response::json(200, &json!({"accepted": n}))
@@ -431,20 +503,33 @@ impl App {
 
     fn device_start(&self, r: &Request) -> Response {
         let f = r.form();
-        let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str()).unwrap_or("");
+        let get = |k: &str| {
+            f.iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
         let client_id = get("client_id");
         if client_id != self.cfg.client_id {
             return Response::json(400, &json!({"error": "invalid_client"}));
         }
-        let Some(machine) = get("scope").split(' ').find_map(|s| s.strip_prefix(SCOPE_MACHINE)) else {
-            return Response::json(400, &json!({"error": "invalid_scope", "error_description": "escopo sem openvnc:machine:<id>"}));
+        let Some(machine) = get("scope")
+            .split(' ')
+            .find_map(|s| s.strip_prefix(SCOPE_MACHINE))
+        else {
+            return Response::json(
+                400,
+                &json!({"error": "invalid_scope", "error_description": "escopo sem openvnc:machine:<id>"}),
+            );
         };
         if !valid_name(machine) {
             return Response::json(400, &json!({"error": "invalid_scope"}));
         }
         let device_code = random_token(32);
         let user_code = {
-            let raw = random_token(12).to_ascii_uppercase().replace(['-', '_', '0', 'O', '1', 'I'], "X");
+            let raw = random_token(12)
+                .to_ascii_uppercase()
+                .replace(['-', '_', '0', 'O', '1', 'I'], "X");
             format!("{}-{}", &raw[..4], &raw[4..8])
         };
         let mut d = self.devices.lock().unwrap();
@@ -479,7 +564,12 @@ impl App {
 
     fn device_token(&self, r: &Request) -> Response {
         let f = r.form();
-        let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str()).unwrap_or("");
+        let get = |k: &str| {
+            f.iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
         if get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code" {
             return Response::json(400, &json!({"error": "unsupported_grant_type"}));
         }
@@ -501,11 +591,15 @@ impl App {
                 return Response::json(400, &json!({"error": "access_denied"}));
             }
             let Some(user) = dev.approved.clone() else {
-                let fast = dev
-                    .last_poll
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(DEVICE_INTERVAL * 1000 - 500));
+                let fast = dev.last_poll.is_some_and(|t| {
+                    t.elapsed() < Duration::from_millis(DEVICE_INTERVAL * 1000 - 500)
+                });
                 dev.last_poll = Some(Instant::now());
-                let e = if fast { "slow_down" } else { "authorization_pending" };
+                let e = if fast {
+                    "slow_down"
+                } else {
+                    "authorization_pending"
+                };
                 return Response::json(400, &json!({"error": e}));
             };
             let machine = dev.machine.clone();
@@ -514,14 +608,25 @@ impl App {
             (user, machine)
         };
         match self.issue(&user, &machine, "device", r.peer) {
-            Ok(t) => Response::json(200, &json!({"id_token": t, "token_type": "Bearer", "expires_in": self.cfg.ticket_ttl})),
+            Ok(t) => Response::json(
+                200,
+                &json!({"id_token": t, "token_type": "Bearer", "expires_in": self.cfg.ticket_ttl}),
+            ),
             Err(_) => Response::json(400, &json!({"error": "access_denied"})),
         }
     }
 
     fn device_page(&self, code: String, msg: Option<&str>) -> Response {
-        let code = html_escape(&code.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(16).collect::<String>());
-        let m = msg.map(|m| format!("<p class=\"m\">{}</p>", html_escape(m))).unwrap_or_default();
+        let code = html_escape(
+            &code
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .take(16)
+                .collect::<String>(),
+        );
+        let m = msg
+            .map(|m| format!("<p class=\"m\">{}</p>", html_escape(m)))
+            .unwrap_or_default();
         Response::html(
             200,
             page(
@@ -540,7 +645,12 @@ impl App {
 
     fn device_submit(&self, r: &Request) -> Response {
         let f = r.form();
-        let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()).unwrap_or_default();
+        let get = |k: &str| {
+            f.iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
         let code = get("user_code").trim().to_ascii_uppercase();
         let user = get("user").trim().to_owned();
         let pw = get("password");
@@ -548,29 +658,63 @@ impl App {
             return self.device_page(code, Some("Informe usuario e senha."));
         }
         if let Err(e) = self.check_password(&user, &pw, r.peer, "device") {
-            let msg = if e.status == 429 { "Muitas tentativas. Aguarde e tente de novo." } else { "Usuario ou senha invalidos." };
+            let msg = if e.status == 429 {
+                "Muitas tentativas. Aguarde e tente de novo."
+            } else {
+                "Usuario ou senha invalidos."
+            };
             return self.device_page(code, Some(msg));
         }
         let mut d = self.devices.lock().unwrap();
         let now = Instant::now();
-        let Some(dev) = d.values_mut().find(|v| v.user_code == code && v.exp > now && v.approved.is_none()) else {
+        let Some(dev) = d
+            .values_mut()
+            .find(|v| v.user_code == code && v.exp > now && v.approved.is_none())
+        else {
             return self.device_page(String::new(), Some("Codigo invalido ou expirado."));
         };
         if get("action") == "deny" {
             dev.denied = true;
-            return Response::html(200, page("Acesso negado", "<p>Pedido negado. Pode fechar esta janela.</p>"));
+            return Response::html(
+                200,
+                page(
+                    "Acesso negado",
+                    "<p>Pedido negado. Pode fechar esta janela.</p>",
+                ),
+            );
         }
         let machine = dev.machine.clone();
         if self.store().effective(&user, &machine).is_none() {
             dev.denied = true;
             drop(d);
-            self.rec("central_ticket", &[("user", &user), ("machine", &machine), ("via", "device"), ("ip", &r.peer.to_string()), ("result", "negado")]);
-            return Response::html(403, page("Sem permissao", "<p>Seu usuario nao tem acesso a esta maquina.</p>"));
+            self.rec(
+                "central_ticket",
+                &[
+                    ("user", &user),
+                    ("machine", &machine),
+                    ("via", "device"),
+                    ("ip", &r.peer.to_string()),
+                    ("result", "negado"),
+                ],
+            );
+            return Response::html(
+                403,
+                page(
+                    "Sem permissao",
+                    "<p>Seu usuario nao tem acesso a esta maquina.</p>",
+                ),
+            );
         }
         dev.approved = Some(user);
         Response::html(
             200,
-            page("Acesso aprovado", &format!("<p>Acesso a <b>{}</b> aprovado. Pode fechar esta janela.</p>", html_escape(&machine))),
+            page(
+                "Acesso aprovado",
+                &format!(
+                    "<p>Acesso a <b>{}</b> aprovado. Pode fechar esta janela.</p>",
+                    html_escape(&machine)
+                ),
+            ),
         )
     }
 }

@@ -70,7 +70,11 @@ impl Signer {
     /// Assina claims arbitrarias.
     pub fn sign(&self, claims: &Value) -> Result<String> {
         let h = json!({"alg": "ES256", "typ": "JWT", "kid": self.kid});
-        let m = format!("{}.{}", B64.encode(h.to_string()), B64.encode(claims.to_string()));
+        let m = format!(
+            "{}.{}",
+            B64.encode(h.to_string()),
+            B64.encode(claims.to_string())
+        );
         let sig = self
             .kp
             .sign(&self.rng, m.as_bytes())
@@ -100,8 +104,9 @@ mod tests {
     use openvnc_security::oidc::{verify_offline, Jwks, Policy};
 
     fn setup() -> (Signer, Jwks) {
-        let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
-            .unwrap();
+        let doc =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
+                .unwrap();
         let s = Signer::new(doc.as_ref()).unwrap();
         let j = Jwks::parse(&s.jwks());
         (s, j)

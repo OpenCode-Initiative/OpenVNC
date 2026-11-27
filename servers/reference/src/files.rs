@@ -27,11 +27,13 @@ pub fn set_sending(on: bool) {
 }
 
 /// O envio esta habilitado?
+#[cfg_attr(not(windows), allow(dead_code))] // usado pela bandeja (so Windows)
 pub fn sending_enabled() -> bool {
     SEND_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Oferece `path` a todas as sessoes que aceitam envio. Retorna quantas.
+#[cfg_attr(not(windows), allow(dead_code))] // usado pela bandeja (so Windows)
 pub fn offer_file(path: PathBuf) -> usize {
     if !sending_enabled() {
         return 0;

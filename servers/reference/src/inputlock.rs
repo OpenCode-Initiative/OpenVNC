@@ -178,7 +178,7 @@ mod win {
                     WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     cls.as_ptr(),
                     txt.as_ptr(),
-                    WS_POPUP | WS_VISIBLE | WS_BORDER | 0x0001 | 0x0200 /* SS_CENTER | SS_CENTERIMAGE */,
+                    WS_POPUP | WS_VISIBLE | WS_BORDER | 0x0001 | 0x0200, /* SS_CENTER | SS_CENTERIMAGE */
                     20,
                     20,
                     640,

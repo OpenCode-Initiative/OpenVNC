@@ -328,7 +328,9 @@ async fn run(listener: TcpListener, cfg: Config, password: Option<String>) -> an
     let oidc = match (&cfg.oidc_issuer, &cfg.oidc_client_id) {
         (Some(issuer), Some(aud)) => {
             let ca = match &cfg.oidc_ca {
-                Some(p) => Some(std::fs::read(p).with_context(|| format!("lendo {}", p.display()))?),
+                Some(p) => {
+                    Some(std::fs::read(p).with_context(|| format!("lendo {}", p.display()))?)
+                }
                 None => None,
             };
             let v = openvnc_security::oidc::Verifier::new(

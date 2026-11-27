@@ -121,15 +121,13 @@ pub fn url_decode(s: &str) -> String {
     while i < b.len() {
         match b[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match (unhex(b[i + 1]), unhex(b[i + 2])) {
-                    (Some(h), Some(l)) => {
-                        out.push(h << 4 | l);
-                        i += 2;
-                    }
-                    _ => out.push(b'%'),
+            b'%' if i + 2 < b.len() => match (unhex(b[i + 1]), unhex(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 2;
                 }
-            }
+                _ => out.push(b'%'),
+            },
             c => out.push(c),
         }
         i += 1;
@@ -275,7 +273,10 @@ mod tests {
         assert_eq!(f[2].1, "%zz");
         assert_eq!(f[3].1, "%4");
         assert_eq!(url_decode(&url_encode("a b/c&d")), "a b/c&d");
-        assert_eq!(html_escape("<a href='x'>&"), "&lt;a href=&#39;x&#39;&gt;&amp;");
+        assert_eq!(
+            html_escape("<a href='x'>&"),
+            "&lt;a href=&#39;x&#39;&gt;&amp;"
+        );
     }
 
     #[tokio::test]
@@ -286,8 +287,14 @@ mod tests {
         assert_eq!((r.method.as_str(), r.path.as_str()), ("POST", "/api/login"));
         assert_eq!(r.query_get("a").as_deref(), Some("1"));
         assert_eq!(r.body, b"abcd");
-        let big = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
-        assert_eq!(read_request(&mut big.as_bytes(), ip).await.unwrap_err(), 413);
+        let big = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        assert_eq!(
+            read_request(&mut big.as_bytes(), ip).await.unwrap_err(),
+            413
+        );
         let chunked = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(read_request(&mut &chunked[..], ip).await.unwrap_err(), 400);
         let huge = vec![b'a'; MAX_HEAD + 10];

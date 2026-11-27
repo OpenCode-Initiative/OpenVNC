@@ -225,7 +225,10 @@ fn fs_samples() -> Vec<Message> {
         replies
             .into_iter()
             .enumerate()
-            .map(|(i, reply)| Message::FsResponse { id: i as u32, reply }),
+            .map(|(i, reply)| Message::FsResponse {
+                id: i as u32,
+                reply,
+            }),
     );
     v.push(Message::InputLock { on: true });
     v.push(Message::InputLock { on: false });

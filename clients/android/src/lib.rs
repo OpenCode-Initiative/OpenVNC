@@ -41,7 +41,11 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         let h = kb.native_window().map(|w| w.height()).unwrap_or(0);
         let ppp = ctx.pixels_per_point().max(0.1);
         let top = r.top.max(0) as f32 / ppp;
-        let bottom = if h > 0 && r.bottom > 0 { (h - r.bottom).max(0) as f32 / ppp } else { 0.0 };
+        let bottom = if h > 0 && r.bottom > 0 {
+            (h - r.bottom).max(0) as f32 / ppp
+        } else {
+            0.0
+        };
         (top, bottom)
     });
     if let Err(e) = desktop::run_mobile(opts, hook) {

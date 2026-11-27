@@ -252,8 +252,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -298,7 +297,12 @@ fn main() -> Result<()> {
             let ask = g.ask.map(|a| a.to_string()).unwrap_or_default();
             audit(&cfg).record(
                 "admin_grant",
-                &[("subject", &subj), ("machine", &g.who.machine), ("perms", &ps), ("ask", &ask)],
+                &[
+                    ("subject", &subj),
+                    ("machine", &g.who.machine),
+                    ("perms", &ps),
+                    ("ask", &ask),
+                ],
             );
             println!("concedido: {subj} -> {} [{ps}]", g.who.machine);
         }
@@ -306,12 +310,16 @@ fn main() -> Result<()> {
             let mut st = Store::load(&sp)?;
             let subj = s.subject();
             let n = st.grants.len();
-            st.grants.retain(|g| !(g.subject == subj && g.machine == s.machine));
+            st.grants
+                .retain(|g| !(g.subject == subj && g.machine == s.machine));
             if st.grants.len() == n {
                 bail!("concessao inexistente");
             }
             st.save(&sp)?;
-            audit(&cfg).record("admin_revoke", &[("subject", &subj), ("machine", &s.machine)]);
+            audit(&cfg).record(
+                "admin_revoke",
+                &[("subject", &subj), ("machine", &s.machine)],
+            );
             println!("revogado: {subj} -> {}", s.machine);
         }
         Cmd::Grants => {
@@ -340,7 +348,11 @@ fn user_cmd(cfg: &Config, sp: &Path, c: UserCmd) -> Result<()> {
     let mut st = Store::load(sp)?;
     let log = audit(cfg);
     match c {
-        UserCmd::Add { name, admin, groups } => {
+        UserCmd::Add {
+            name,
+            admin,
+            groups,
+        } => {
             name_ok("usuario", &name)?;
             if st.users.contains_key(&name) {
                 bail!("usuario ja existe");
@@ -362,7 +374,10 @@ fn user_cmd(cfg: &Config, sp: &Path, c: UserCmd) -> Result<()> {
                 },
             );
             st.save(sp)?;
-            log.record("admin_user_add", &[("user", &name), ("admin", &admin.to_string())]);
+            log.record(
+                "admin_user_add",
+                &[("user", &name), ("admin", &admin.to_string())],
+            );
             println!("usuario criado: {name}");
         }
         UserCmd::Passwd { name } => {
@@ -375,13 +390,19 @@ fn user_cmd(cfg: &Config, sp: &Path, c: UserCmd) -> Result<()> {
             println!("senha trocada: {name}");
         }
         UserCmd::Disable { name } => {
-            st.users.get_mut(&name).context("usuario inexistente")?.disabled = true;
+            st.users
+                .get_mut(&name)
+                .context("usuario inexistente")?
+                .disabled = true;
             st.save(sp)?;
             log.record("admin_user_disable", &[("user", &name)]);
             println!("usuario desativado: {name}");
         }
         UserCmd::Enable { name } => {
-            st.users.get_mut(&name).context("usuario inexistente")?.disabled = false;
+            st.users
+                .get_mut(&name)
+                .context("usuario inexistente")?
+                .disabled = false;
             st.save(sp)?;
             log.record("admin_user_enable", &[("user", &name)]);
             println!("usuario reativado: {name}");
@@ -456,7 +477,10 @@ fn group_cmd(cfg: &Config, sp: &Path, c: GroupCmd) -> Result<()> {
                 .groups
                 .insert(group.clone());
             st.save(sp)?;
-            log.record("admin_group_add_user", &[("group", &group), ("user", &user)]);
+            log.record(
+                "admin_group_add_user",
+                &[("group", &group), ("user", &user)],
+            );
             println!("{user} entrou em {group}");
         }
         GroupCmd::RemoveUser { group, user } => {
@@ -466,7 +490,10 @@ fn group_cmd(cfg: &Config, sp: &Path, c: GroupCmd) -> Result<()> {
                 .groups
                 .remove(&group);
             st.save(sp)?;
-            log.record("admin_group_remove_user", &[("group", &group), ("user", &user)]);
+            log.record(
+                "admin_group_remove_user",
+                &[("group", &group), ("user", &user)],
+            );
             println!("{user} saiu de {group}");
         }
     }
@@ -514,7 +541,14 @@ fn machine_cmd(cfg: &Config, sp: &Path, c: MachineCmd) -> Result<()> {
                 },
             );
             st.save(sp)?;
-            log.record("admin_machine_add", &[("machine", &id), ("address", &address), ("port", &port.to_string())]);
+            log.record(
+                "admin_machine_add",
+                &[
+                    ("machine", &id),
+                    ("address", &address),
+                    ("port", &port.to_string()),
+                ],
+            );
             println!("maquina cadastrada: {id}");
             println!("segredo (mostrado uma unica vez, guarde em central_secret do servidor):");
             println!("{secret}");
@@ -539,8 +573,10 @@ fn machine_cmd(cfg: &Config, sp: &Path, c: MachineCmd) -> Result<()> {
         }
         MachineCmd::ResetSecret { id } => {
             let secret = new_secret();
-            st.machines.get_mut(&id).context("maquina inexistente")?.secret_sha256 =
-                sha256_hex(secret.as_bytes());
+            st.machines
+                .get_mut(&id)
+                .context("maquina inexistente")?
+                .secret_sha256 = sha256_hex(secret.as_bytes());
             st.save(sp)?;
             log.record("admin_machine_reset_secret", &[("machine", &id)]);
             println!("novo segredo de {id} (mostrado uma unica vez):");
@@ -561,7 +597,9 @@ fn serve(cfg: Config) -> Result<()> {
     let log = Arc::new(AuditLog::open(&cfg.audit_path())?);
     let max = cfg.max_connections;
     let app = Arc::new(api::App::new(cfg, &p.signing_pkcs8, p.ca_pem, log.clone())?);
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         let l = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!(

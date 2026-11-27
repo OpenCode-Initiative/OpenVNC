@@ -102,7 +102,9 @@ pub fn write_atomic(p: &Path, data: &[u8], private: bool) -> Result<()> {
         }
         #[cfg(not(unix))]
         let _ = private;
-        let mut f = o.open(&tmp).with_context(|| format!("gravando {}", tmp.display()))?;
+        let mut f = o
+            .open(&tmp)
+            .with_context(|| format!("gravando {}", tmp.display()))?;
         f.write_all(data)?;
         f.sync_all()?;
     }
@@ -122,8 +124,7 @@ pub fn sha256_hex(b: &[u8]) -> String {
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s
-            .chars()
+        && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
 }
 
@@ -146,7 +147,8 @@ impl Store {
     /// Le `p` (inexistente: banco vazio).
     pub fn load(p: &Path) -> Result<Self> {
         match std::fs::read(p) {
-            Ok(b) => serde_json::from_slice(&b).with_context(|| format!("banco invalido: {}", p.display())),
+            Ok(b) => serde_json::from_slice(&b)
+                .with_context(|| format!("banco invalido: {}", p.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
             Err(e) => Err(e.into()),
         }
@@ -220,16 +222,17 @@ impl Store {
         };
         let got = sha256_hex(secret.as_bytes());
         let want = m.secret_sha256.as_bytes();
-        got.len() == want.len()
-            && got
-                .bytes()
-                .zip(want)
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
+        got.len() == want.len() && got.bytes().zip(want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
     }
 
     /// Adiciona ou substitui a concessao de `subject` em `machine`.
-    pub fn grant(&mut self, subject: &str, machine: &str, perms: BTreeSet<String>, ask: Option<bool>) -> Result<()> {
+    pub fn grant(
+        &mut self,
+        subject: &str,
+        machine: &str,
+        perms: BTreeSet<String>,
+        ask: Option<bool>,
+    ) -> Result<()> {
         match subject.split_once(':') {
             Some(("user", n)) if self.users.contains_key(n) => {}
             Some(("group", n)) if self.groups.contains(n) => {}
@@ -283,10 +286,20 @@ mod tests {
     fn uniao_de_permissoes_e_grupos() {
         let mut s = base();
         assert_eq!(s.effective("alice", "pc-01"), None);
-        s.grant("group:suporte", "pc-01", parse_perms("control").unwrap(), None)
-            .unwrap();
-        s.grant("user:alice", "pc-01", parse_perms("files").unwrap(), Some(true))
-            .unwrap();
+        s.grant(
+            "group:suporte",
+            "pc-01",
+            parse_perms("control").unwrap(),
+            None,
+        )
+        .unwrap();
+        s.grant(
+            "user:alice",
+            "pc-01",
+            parse_perms("files").unwrap(),
+            Some(true),
+        )
+        .unwrap();
         let e = s.effective("alice", "pc-01").unwrap();
         assert_eq!(e.perms, vec!["view", "control", "files"]);
         assert_eq!(e.ask, Some(true));
@@ -298,7 +311,9 @@ mod tests {
         // usuario desativado perde tudo
         s.users.get_mut("alice").unwrap().disabled = true;
         assert_eq!(s.effective("alice", "pc-01"), None);
-        assert!(s.grant("user:zeca", "pc-01", parse_perms("view").unwrap(), None).is_err());
+        assert!(s
+            .grant("user:zeca", "pc-01", parse_perms("view").unwrap(), None)
+            .is_err());
         assert!(parse_perms("view,root").is_err());
         assert!(parse_perms("").is_err());
     }
@@ -315,7 +330,10 @@ mod tests {
             b"senha-da-alice",
             &t.users["alice"].hash
         ));
-        assert!(!openvnc_security::passhash::verify(b"errada", &t.users["alice"].hash));
+        assert!(!openvnc_security::passhash::verify(
+            b"errada",
+            &t.users["alice"].hash
+        ));
         assert!(t.machine_secret_ok("pc-01", "segredo-maquina"));
         assert!(!t.machine_secret_ok("pc-01", "outro"));
         assert!(!t.machine_secret_ok("pc-02", "segredo-maquina"));

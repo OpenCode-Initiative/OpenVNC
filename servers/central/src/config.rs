@@ -51,8 +51,8 @@ impl Default for Config {
 impl Config {
     /// Le e valida. Caminhos relativos sao relativos ao arquivo.
     pub fn load(path: &Path) -> Result<Self> {
-        let txt = std::fs::read_to_string(path)
-            .with_context(|| format!("lendo {}", path.display()))?;
+        let txt =
+            std::fs::read_to_string(path).with_context(|| format!("lendo {}", path.display()))?;
         let mut c: Config = toml::from_str(&txt).context("configuracao invalida")?;
         let base = path.parent().unwrap_or(Path::new("."));
         if c.state_dir.is_relative() {

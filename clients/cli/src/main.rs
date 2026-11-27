@@ -214,7 +214,9 @@ fn central_native(
     let user = c.user.as_deref().context("--central exige --user")?;
     let central = central_client(url, ca)?;
     let pw = central_password(c.password_stdin)?;
-    let s = central.login(user, &pw).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let s = central
+        .login(user, &pw)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     drop(pw);
     let list = central.machines(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
     let m = list

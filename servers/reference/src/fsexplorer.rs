@@ -366,7 +366,13 @@ fn mtime(m: &fs::Metadata) -> u64 {
 
 /// Registra na auditoria. Leituras e escritas so no primeiro bloco (inicio
 /// de cada download/upload); falhas sempre.
-pub fn audit(audit: &openvnc_security::audit::AuditLog, peer: &str, user: &str, op: &FsOp, reply: &FsReply) {
+pub fn audit(
+    audit: &openvnc_security::audit::AuditLog,
+    peer: &str,
+    user: &str,
+    op: &FsOp,
+    reply: &FsReply,
+) {
     let (event, path, extra): (&str, &str, String) = match op {
         FsOp::Roots => return,
         FsOp::List { path } => ("fs_list", path, String::new()),
@@ -458,7 +464,10 @@ mod tests {
         let (_t, root, out) = setup();
         let x = Explorer::with(Some(&root), true, true, 1 << 20);
         // dentro
-        assert!(matches!(x.handle(&FsOp::List { path: s(&root) }), FsReply::Entries { .. }));
+        assert!(matches!(
+            x.handle(&FsOp::List { path: s(&root) }),
+            FsReply::Entries { .. }
+        ));
         // fora (absoluto)
         err(x.handle(&FsOp::List { path: s(&out) }));
         err(x.handle(&FsOp::Read {
@@ -467,7 +476,12 @@ mod tests {
             len: 10,
         }));
         // travessia
-        let trav = format!("{}{}..{}fora", s(&root), std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
+        let trav = format!(
+            "{}{}..{}fora",
+            s(&root),
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
         err(x.handle(&FsOp::List { path: trav }));
         // criar fora
         err(x.handle(&FsOp::Mkdir {
@@ -489,7 +503,9 @@ mod tests {
         assert!(root.exists() && out.join("segredo.txt").exists());
         // raizes = so a raiz configurada
         match x.handle(&FsOp::Roots) {
-            FsReply::Roots { roots } => assert_eq!(roots, vec![display(&fs::canonicalize(&root).unwrap())]),
+            FsReply::Roots { roots } => {
+                assert_eq!(roots, vec![display(&fs::canonicalize(&root).unwrap())])
+            }
             o => panic!("{o:?}"),
         }
     }
@@ -549,7 +565,12 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
-        assert_eq!(x.handle(&FsOp::Mkdir { path: s(&root.join("p")) }), FsReply::Ok);
+        assert_eq!(
+            x.handle(&FsOp::Mkdir {
+                path: s(&root.join("p"))
+            }),
+            FsReply::Ok
+        );
         assert_eq!(
             x.handle(&FsOp::Rename {
                 from: s(&f),
@@ -562,7 +583,9 @@ mod tests {
             from: s(&root.join("p")),
             to: s(&root.join("p").join("q")),
         }));
-        match x.handle(&FsOp::List { path: s(&root.join("p")) }) {
+        match x.handle(&FsOp::List {
+            path: s(&root.join("p")),
+        }) {
             FsReply::Entries { entries, .. } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].name, "r.bin");
@@ -570,7 +593,12 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
-        assert_eq!(x.handle(&FsOp::Delete { path: s(&root.join("p")) }), FsReply::Ok);
+        assert_eq!(
+            x.handle(&FsOp::Delete {
+                path: s(&root.join("p"))
+            }),
+            FsReply::Ok
+        );
         assert!(!root.join("p").exists());
         // limite de tamanho
         let small = Explorer::with(Some(&root), true, true, 4);
@@ -586,7 +614,10 @@ mod tests {
     fn permissoes() {
         let (_t, root, _out) = setup();
         let ro = Explorer::with(Some(&root), true, false, 1 << 20);
-        assert!(matches!(ro.handle(&FsOp::List { path: s(&root) }), FsReply::Entries { .. }));
+        assert!(matches!(
+            ro.handle(&FsOp::List { path: s(&root) }),
+            FsReply::Entries { .. }
+        ));
         err(ro.handle(&FsOp::Delete {
             path: s(&root.join("a.txt")),
         }));

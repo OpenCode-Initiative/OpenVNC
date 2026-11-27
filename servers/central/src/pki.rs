@@ -114,8 +114,9 @@ pub fn ensure(dir: &Path, names: &[String]) -> Result<Pki> {
             .decode(std::fs::read_to_string(&sk_p)?.trim())
             .context("signing.key invalida")?
     } else {
-        let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
-            .map_err(|_| anyhow!("falha ao gerar a chave de assinatura"))?;
+        let doc =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
+                .map_err(|_| anyhow!("falha ao gerar a chave de assinatura"))?;
         write_private(&sk_p, STANDARD.encode(doc.as_ref()).as_bytes())?;
         doc.as_ref().to_vec()
     };

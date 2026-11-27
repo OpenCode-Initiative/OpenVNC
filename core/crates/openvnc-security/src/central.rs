@@ -71,7 +71,9 @@ impl Central {
     pub fn new(url: &str, ca_pem: Option<&[u8]>) -> Result<Self, Error> {
         let base = url.trim().trim_end_matches('/').to_owned();
         if !base.starts_with("https://") {
-            return Err(Error(format!("URL do servidor central precisa ser https: {base}")));
+            return Err(Error(format!(
+                "URL do servidor central precisa ser https: {base}"
+            )));
         }
         Ok(Self {
             base,

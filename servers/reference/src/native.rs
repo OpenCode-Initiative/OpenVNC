@@ -605,8 +605,10 @@ async fn session(
             .map_err(|_| anyhow::anyhow!("timeout no handshake"))??;
     // sem credencial, so com autorizacao local (allow_attended)
     if !perms.has("view") {
-        sh.audit
-            .record("rejected", &[("peer", peer), ("reason", "sem_permissao_view")]);
+        sh.audit.record(
+            "rejected",
+            &[("peer", peer), ("reason", "sem_permissao_view")],
+        );
         close(ctrl, close_code::AUTH_FAILED, "sem permissao de ver a tela").await;
         bail!("ticket sem permissao view");
     }
@@ -833,7 +835,11 @@ impl Drop for Locked {
     fn drop(&mut self) {
         self.audit.record(
             "input_unlock",
-            &[("peer", &self.peer), ("user", &self.user), ("reason", self.reason)],
+            &[
+                ("peer", &self.peer),
+                ("user", &self.user),
+                ("reason", self.reason),
+            ],
         );
     }
 }

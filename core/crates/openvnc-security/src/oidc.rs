@@ -362,7 +362,8 @@ fn verify_at(token: &str, jwks: &Jwks, p: &Policy, t: u64) -> Result<Identity, O
 /// Verifica `token` contra chaves ja conhecidas no instante `t` (sem rede e
 /// sem controle de reuso). Usado em testes e ferramentas.
 pub fn verify_offline(token: &str, jwks: &Jwks, p: &Policy, t: u64) -> Result<Identity, Error> {
-    verify_at(token, jwks, p, t).map_err(|e| e.unwrap_or_else(|| Error("chave (kid) desconhecida".into())))
+    verify_at(token, jwks, p, t)
+        .map_err(|e| e.unwrap_or_else(|| Error("chave (kid) desconhecida".into())))
 }
 
 struct VerifierState {
@@ -450,7 +451,9 @@ const MAX_NET_FAILS: u32 = 5;
 
 fn warn_retry(n: u32, e: &ureq::Error) {
     // sem tracing nesta crate: so stderr, e a mensagem nao traz segredos
-    eprintln!("aviso: falha de rede ao buscar o token ({n}/{MAX_NET_FAILS}), tentando de novo: {e}");
+    eprintln!(
+        "aviso: falha de rede ao buscar o token ({n}/{MAX_NET_FAILS}), tentando de novo: {e}"
+    );
 }
 
 /// Codigo para o usuario aprovar no navegador.
@@ -693,7 +696,10 @@ mod tests {
         let plain = sign(&kp, h, claims(t));
         p.machine = Some("pc-01".into());
         assert!(verify_at(&plain, &jwks, &p, t).is_err());
-        assert!(verify_at(&plain, &jwks, &policy(), t).unwrap().perms.is_none());
+        assert!(verify_at(&plain, &jwks, &policy(), t)
+            .unwrap()
+            .perms
+            .is_none());
     }
 
     #[test]
