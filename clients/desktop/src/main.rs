@@ -273,7 +273,7 @@ pub fn run_mobile(opts: eframe::NativeOptions, hook: MobileHook) -> eframe::Resu
         Box::new(move |cc| {
             ui_style(&cc.egui_ctx);
             // telas pequenas: tudo um pouco maior para o dedo
-            cc.egui_ctx.set_zoom_factor(1.25);
+            cc.egui_ctx.set_zoom_factor(1.0);
             let mut app = App::new();
             app.touchpad = true;
             app.mobile = true;
@@ -1141,7 +1141,7 @@ impl App {
         let ctx = ui.ctx().clone();
         self.central_poll(&ctx);
         let field = |ui: &mut egui::Ui, label: &str| {
-            ui.add_space(8.0);
+            ui.add_space(5.0);
             ui.label(egui::RichText::new(label).strong());
         };
         let busy = self.central.busy.is_some();
@@ -1224,20 +1224,21 @@ impl App {
 
     fn connect_form(&mut self, ui: &mut egui::Ui) {
         let field = |ui: &mut egui::Ui, label: &str| {
-            ui.add_space(8.0);
+            ui.add_space(5.0);
             ui.label(egui::RichText::new(label).strong());
         };
         fn big(t: egui::TextEdit<'_>) -> egui::TextEdit<'_> {
-            t.margin(egui::vec2(10.0, 8.0)).font(egui::TextStyle::Body)
+            t.margin(egui::vec2(8.0, 6.0)).font(egui::TextStyle::Body)
         }
         ui.vertical_centered(|ui| {
-            ui.heading(egui::RichText::new("OpenVNC").size(34.0).strong());
+            ui.heading(egui::RichText::new("OpenVNC").size(26.0).strong());
             ui.label(egui::RichText::new("Acesse outro computador").weak());
         });
-        ui.add_space(10.0);
-        ui.checkbox(&mut self.central.on, "Servidor central da empresa")
-            .on_hover_text("Entra no servidor central OpenVNC e lista as maquinas liberadas.");
+        ui.add_space(6.0);
         if self.central.on {
+            if ui.button("< Conexao direta").clicked() {
+                self.central.on = false;
+            }
             self.central_form(ui);
             return;
         }
@@ -1272,6 +1273,8 @@ impl App {
             .desired_width(f32::INFINITY)));
         ui.add_space(10.0);
         egui::CollapsingHeader::new("Opcoes avancadas").show(ui, |ui| {
+            ui.checkbox(&mut self.central.on, "Servidor central da empresa")
+                .on_hover_text("Entra no servidor central OpenVNC e lista as maquinas liberadas.");
             field(ui, "Seguranca");
             egui::ComboBox::from_id_salt("sec")
                 .width(ui.available_width())
@@ -1333,13 +1336,13 @@ impl App {
         ui.add_space(16.0);
         let btn = egui::Button::new(
             egui::RichText::new("Conectar")
-                .size(19.0)
+                .size(17.0)
                 .strong()
                 .color(egui::Color32::WHITE),
         )
         .fill(egui::Color32::from_rgb(0x2F, 0x6F, 0xEB))
         .corner_radius(8.0)
-        .min_size(egui::vec2(ui.available_width(), 44.0));
+        .min_size(egui::vec2(ui.available_width(), 40.0));
         let plain_pw = self.security == Security::None && !self.password.is_empty();
         if plain_pw {
             ui.checkbox(

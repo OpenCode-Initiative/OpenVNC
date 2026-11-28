@@ -510,9 +510,8 @@ impl Client {
                     )));
                 };
                 if chosen == vencrypt::X509_PLAIN && self.cfg.username.is_none() {
-                    return Err(Error::Protocol(
-                        "servidor exige usuario e senha (X509Plain)".into(),
-                    ));
+                    // so senha: usuario padrao da senha de acesso remoto
+                    self.cfg.username = Some("openvnc".into());
                 }
                 self.subtype = Some(chosen);
                 self.out.extend_from_slice(&chosen.to_be_bytes());
